@@ -518,7 +518,8 @@ def main():
     t.start()
     print(f"[caproute] Discovery refresh every {DISCOVERY_INTERVAL}s")
 
-    server = http.server.HTTPServer(("0.0.0.0", args.port), CaprouteHandler)
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), CaprouteHandler)
+    server.daemon_threads = True
     print(f"[caproute] Listening on http://0.0.0.0:{args.port}")
     try:
         server.serve_forever()
