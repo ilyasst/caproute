@@ -9,5 +9,14 @@
     "thinking":  ["qwen3.5:27b"],
     "adequate":  ["qwen2.5:7b", "gemma3:4b"],
     "vision":    ["gemma3:4b"]
+  },
+  "timeouts": {
+    "thinking": 600,
+    "powerful": 300,
+    "fast": 60,
+    "adequate": 120,
+    "vision": 180,
+    "style": 60,
+    "_default": 300
   }
 }

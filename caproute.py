@@ -129,6 +129,12 @@ def _is_new_format(cfg):
     return "capabilities" in cfg
 
 
+def _get_timeout(cfg, capability):
+    """Get timeout for a capability from config, with fallback."""
+    timeouts = cfg.get("timeouts", {})
+    return timeouts.get(capability, timeouts.get("_default", REQUEST_TIMEOUT))
+
+
 def _get_hosts(cfg):
     """Get hosts dict, normalizing url key across formats."""
     hosts = {}
@@ -376,10 +382,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             untagged = sorted(set(discovered.keys()) - tagged)
 
             hosts = _get_hosts(cfg)
+            caps = get_capabilities()
+            cap_models = {c: _get_capability_models(cfg, c) for c in caps}
             self._send_json({
                 "status": "ok",
                 "config": str(CONFIG_PATH),
-                "capabilities": get_capabilities(),
+                "capabilities": caps,
+                "capability_models": cap_models,
                 "hosts": list(hosts.keys()),
                 "discovered_models": len(discovered),
                 "untagged_models": untagged,
@@ -434,7 +443,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         if "max_tokens" in req:
             params["max_tokens"] = req["max_tokens"]
 
-        timeout = req.get("timeout", REQUEST_TIMEOUT)
+        # Per-capability timeout from config, overridable by request
+        cfg = load_config()
+        default_timeout = _get_timeout(cfg, model_field)
+        timeout = req.get("timeout", default_timeout)
 
         # Resolve: capability name or direct model name
         backends = resolve_capability(model_field)
