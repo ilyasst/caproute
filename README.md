@@ -12,36 +12,41 @@ Client                          caproute (:8800)                    Backends
   │ POST /v1/chat/completions        │                                  │
   │ {"model": "powerful", ...}       │                                  │
   │─────────────────────────────────>│                                  │
-  │                                  │  resolve "powerful" via llm.json │
-  │                                  │  try qwen2.5:32b @ server-a     │
+  │                                  │  resolve "powerful" via config   │
+  │                                  │  discover qwen2.5:32b @ host-a  │
   │                                  │─────────────────────────────────>│
   │                                  │<─────────────────────────────────│
   │<─────────────────────────────────│  OpenAI-format response          │
 ```
 
-If server-a is down, it falls back to the next model/host in the list.
+If host-a is down, it falls back to the next model/host that has a "powerful" model.
 
 ## Config
 
-Create `~/.config/llm.json`:
+Create `~/.config/llm.json` with two sections:
+
+1. **hosts** — your machines (caproute auto-discovers their models)
+2. **capabilities** — your classification of which models serve which purpose
 
 ```json
 {
-  "models": {
-    "qwen2.5:32b":  { "capabilities": ["fast", "powerful"],  "hosts": ["server-a"] },
-    "gemma3:4b":    { "capabilities": ["fast", "vision"],    "hosts": ["server-b"] }
-  },
   "hosts": {
-    "server-a": { "base_url": "http://server-a:11434", "api": "ollama" },
-    "server-b": { "base_url": "http://server-b:8080",  "api": "openai" }
+    "server-a": { "url": "http://server-a:11434", "api": "ollama" },
+    "server-b": { "url": "http://server-b:8080",  "api": "openai" }
+  },
+  "capabilities": {
+    "powerful":  ["qwen2.5:32b", "qwen2.5:7b"],
+    "fast":      ["qwen2.5:32b", "gemma3:4b"],
+    "thinking":  ["qwen3.5:27b"],
+    "vision":    ["gemma3:4b"]
   }
 }
 ```
 
-- **capabilities**: arbitrary strings — you define what they mean
-- **hosts**: ordered list per model — first is preferred, rest are fallbacks
-- **api**: `"ollama"` or `"openai"` — caproute translates between them
-- Config is re-read on every request, so you can edit it live
+- **hosts**: list your machines. `api` is `"ollama"` or `"openai"` depending on what they run.
+- **capabilities**: arbitrary strings you define. Map each to the models that qualify. Order matters — first model found wins.
+- **Models are auto-discovered** from hosts every 60s. You don't need to say which model is on which host — caproute finds out by querying `/api/tags` (Ollama) or `/v1/models` (OpenAI).
+- Config is re-read on every request, so you can edit it live.
 
 See `llm.json.example` for a full example.
 
@@ -83,19 +88,25 @@ const r = await client.chat.completions.create({ model: "fast", messages: [{ rol
 curl ... -d '{"model": "qwen2.5:7b", "messages": [...]}'
 ```
 
-If the `model` field matches a real model name instead of a capability, caproute routes to it directly.
+If the `model` field matches a real model name instead of a capability, caproute routes to it directly via discovery.
 
-### List capabilities
+### Check what caproute sees
 
 ```bash
+# List capabilities (OpenAI /v1/models format)
 curl http://localhost:8800/v1/models
-```
 
-### Health check
-
-```bash
+# Health: config status, untagged models
 curl http://localhost:8800/health
+
+# Full discovery: every model, which hosts serve it, what capabilities it has
+curl http://localhost:8800/discovery
+
+# Force re-discovery now
+curl -X POST http://localhost:8800/discovery/refresh
 ```
+
+The `/health` endpoint shows **untagged models** — models discovered on your hosts that aren't classified under any capability yet. Useful for spotting new models you forgot to tag.
 
 ## Endpoints
 
@@ -103,7 +114,9 @@ curl http://localhost:8800/health
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completion — put capability in `model` field |
 | `/v1/models` | GET | List available capabilities |
-| `/health` | GET | Config status and host list |
+| `/health` | GET | Config status, untagged models |
+| `/discovery` | GET | Full model-to-host-to-capability map |
+| `/discovery/refresh` | POST | Force immediate re-discovery |
 
 ## Install as systemd service
 
@@ -128,3 +141,4 @@ journalctl --user -u caproute -f
 | `CAPROUTE_PORT` | `8800` | Listen port |
 | `CAPROUTE_CONFIG` | `~/.config/llm.json` | Config file path |
 | `CAPROUTE_TIMEOUT` | `300` | Backend request timeout (seconds) |
+| `CAPROUTE_DISCOVERY_INTERVAL` | `60` | Seconds between host discovery scans |

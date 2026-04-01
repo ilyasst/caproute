@@ -4,7 +4,13 @@ caproute — Capability-routing LLM gateway.
 
 Accepts OpenAI-compatible requests where the "model" field is a capability
 (e.g. "powerful", "fast", "thinking", "vision", "style", "adequate").
-Routes to the best available backend from ~/.config/llm.json with auto-fallback.
+Auto-discovers models from hosts, routes by capability with fallback.
+
+Config (~/.config/llm.json):
+    {
+      "hosts": { "mybox": { "url": "http://mybox:11434", "api": "ollama" } },
+      "capabilities": { "powerful": ["qwen2.5:32b"], "fast": ["gemma3:4b"] }
+    }
 
 Usage:
     python3 caproute.py                    # port 8800
@@ -16,6 +22,7 @@ import argparse
 import http.server
 import json
 import os
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -24,6 +31,91 @@ from pathlib import Path
 CONFIG_PATH = Path(os.environ.get("CAPROUTE_CONFIG", Path.home() / ".config" / "llm.json"))
 DEFAULT_PORT = int(os.environ.get("CAPROUTE_PORT", "8800"))
 REQUEST_TIMEOUT = int(os.environ.get("CAPROUTE_TIMEOUT", "300"))
+DISCOVERY_INTERVAL = int(os.environ.get("CAPROUTE_DISCOVERY_INTERVAL", "60"))
+
+# ── Discovery cache ──────────────────────────────────────────────────
+# Maps model_name -> [{"host": name, "url": base_url, "api": type}, ...]
+_discovery = {}
+_discovery_lock = threading.Lock()
+_last_discovery = 0
+
+
+def _discover_ollama(host_name, base_url):
+    """Query an Ollama host for available models."""
+    url = base_url.rstrip("/") + "/api/tags"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name", "")
+        if name:
+            models.append(name)
+            # Also add without :latest suffix for convenience
+            if name.endswith(":latest"):
+                models.append(name.removesuffix(":latest"))
+    return models
+
+
+def _discover_openai(host_name, base_url):
+    """Query an OpenAI-compatible host for available models."""
+    url = base_url.rstrip("/") + "/v1/models"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+
+
+def run_discovery():
+    """Query all hosts and build model -> hosts map."""
+    global _discovery, _last_discovery
+    cfg = load_config()
+    hosts = _get_hosts(cfg)
+    new_map = {}
+
+    for host_name, host_info in hosts.items():
+        base_url = host_info["url"]
+        api = host_info["api"]
+        try:
+            if api == "ollama":
+                models = _discover_ollama(host_name, base_url)
+            else:
+                models = _discover_openai(host_name, base_url)
+
+            for model in models:
+                if model not in new_map:
+                    new_map[model] = []
+                new_map[model].append({
+                    "host": host_name,
+                    "url": base_url,
+                    "api": api,
+                })
+            print(f"[discovery] {host_name}: {len(models)} models")
+        except Exception as e:
+            print(f"[discovery] {host_name}: UNREACHABLE ({e})")
+
+    with _discovery_lock:
+        _discovery = new_map
+        _last_discovery = time.time()
+
+    return new_map
+
+
+def _discovery_loop():
+    """Background thread that refreshes discovery every DISCOVERY_INTERVAL seconds."""
+    while True:
+        try:
+            run_discovery()
+        except Exception as e:
+            print(f"[discovery] error: {e}")
+        time.sleep(DISCOVERY_INTERVAL)
+
+
+def get_discovery():
+    """Return current discovery cache."""
+    with _discovery_lock:
+        return dict(_discovery)
+
 
 # ── Config ───────────────────────────────────────────────────────────
 
@@ -32,45 +124,118 @@ def load_config():
         return json.load(f)
 
 
+def _is_new_format(cfg):
+    """Detect config format: new has 'capabilities', old has 'models'."""
+    return "capabilities" in cfg
+
+
+def _get_hosts(cfg):
+    """Get hosts dict, normalizing url key across formats."""
+    hosts = {}
+    for name, info in cfg.get("hosts", {}).items():
+        hosts[name] = {
+            "url": info.get("url") or info.get("base_url", ""),
+            "api": info["api"],
+        }
+    return hosts
+
+
 def get_capabilities():
-    """Return set of all capabilities defined in config."""
+    """Return sorted list of all capabilities defined in config."""
     cfg = load_config()
+    if _is_new_format(cfg):
+        return sorted(cfg["capabilities"].keys())
+    # Old format: extract from models
     caps = set()
-    for info in cfg["models"].values():
-        caps.update(info["capabilities"])
+    for info in cfg.get("models", {}).values():
+        caps.update(info.get("capabilities", []))
     return sorted(caps)
 
 
-def get_models_for_capability(capability):
-    """Get ordered list of (model_name, host_info) for a capability."""
+def _get_capability_models(cfg, capability):
+    """Get ordered list of model names for a capability."""
+    if _is_new_format(cfg):
+        return cfg["capabilities"].get(capability, [])
+    # Old format: scan models
+    return [name for name, info in cfg.get("models", {}).items()
+            if capability in info.get("capabilities", [])]
+
+
+def _get_all_tagged_models(cfg):
+    """Get set of all model names that have at least one capability."""
+    if _is_new_format(cfg):
+        tagged = set()
+        for models in cfg["capabilities"].values():
+            tagged.update(models)
+        return tagged
+    return set(cfg.get("models", {}).keys())
+
+
+def resolve_capability(capability):
+    """Resolve a capability to ordered list of backends.
+
+    Looks up which models have this capability, then checks discovery
+    to find which hosts currently serve each model.
+    """
     cfg = load_config()
-    results = []
-    for model_name, info in cfg["models"].items():
-        if capability in info["capabilities"]:
-            for host_name in info["hosts"]:
-                host = cfg["hosts"][host_name]
-                results.append({
+    model_list = _get_capability_models(cfg, capability)
+    if not model_list:
+        return []
+
+    discovered = get_discovery()
+    hosts = _get_hosts(cfg)
+    backends = []
+
+    for model_name in model_list:
+        # Try discovery first (knows actual host availability)
+        disc_hosts = discovered.get(model_name, [])
+        if disc_hosts:
+            for h in disc_hosts:
+                backends.append({
                     "name": model_name,
-                    "base_url": host["base_url"],
-                    "api": host["api"],
-                    "host": host_name,
+                    "base_url": h["url"],
+                    "api": h["api"],
+                    "host": h["host"],
                 })
-    return results
+        elif not _is_new_format(cfg):
+            # Old format fallback: use explicit hosts from config
+            model_info = cfg["models"].get(model_name, {})
+            for host_name in model_info.get("hosts", []):
+                if host_name in hosts:
+                    h = hosts[host_name]
+                    backends.append({
+                        "name": model_name,
+                        "base_url": h["url"],
+                        "api": h["api"],
+                        "host": host_name,
+                    })
+    return backends
 
 
 def resolve_model_direct(model_name):
-    """If model_name is a real model (not a capability), resolve its host."""
+    """Resolve a direct model name (not a capability) via discovery."""
+    discovered = get_discovery()
+    hosts = discovered.get(model_name, [])
+    if hosts:
+        return [{
+            "name": model_name,
+            "base_url": h["url"],
+            "api": h["api"],
+            "host": h["host"],
+        } for h in hosts]
+
+    # Fallback: check old-format config for explicit host mapping
     cfg = load_config()
-    if model_name in cfg["models"]:
-        info = cfg["models"][model_name]
-        for host_name in info["hosts"]:
-            host = cfg["hosts"][host_name]
-            return [{
-                "name": model_name,
-                "base_url": host["base_url"],
-                "api": host["api"],
-                "host": host_name,
-            }]
+    if not _is_new_format(cfg) and model_name in cfg.get("models", {}):
+        cfg_hosts = _get_hosts(cfg)
+        model_info = cfg["models"][model_name]
+        return [{
+            "name": model_name,
+            "base_url": cfg_hosts[h]["url"],
+            "api": cfg_hosts[h]["api"],
+            "host": h,
+        } for h in model_info.get("hosts", []) if h in cfg_hosts]
+
     return []
 
 
@@ -154,7 +319,6 @@ def proxy_to_backend(backend, messages, params, timeout):
 
 class CaprouteHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Compact logging
         print(f"[caproute] {self.address_string()} {args[0] if args else ''}")
 
     def _send_json(self, data, status=200):
@@ -182,6 +346,8 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self._handle_models()
         elif self.path == "/health":
             self._handle_health()
+        elif self.path == "/discovery":
+            self._handle_discovery()
         elif self.path == "/":
             self._send_json({"status": "caproute running"})
         else:
@@ -190,6 +356,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             self._handle_chat()
+        elif self.path == "/discovery/refresh":
+            run_discovery()
+            self._send_json({"status": "ok", "models": get_discovery()})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -202,14 +371,48 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
     def _handle_health(self):
         try:
             cfg = load_config()
+            discovered = get_discovery()
+            tagged = _get_all_tagged_models(cfg)
+            untagged = sorted(set(discovered.keys()) - tagged)
+
+            hosts = _get_hosts(cfg)
             self._send_json({
                 "status": "ok",
                 "config": str(CONFIG_PATH),
                 "capabilities": get_capabilities(),
-                "hosts": list(cfg["hosts"].keys()),
+                "hosts": list(hosts.keys()),
+                "discovered_models": len(discovered),
+                "untagged_models": untagged,
+                "last_discovery": _last_discovery,
             })
         except Exception as e:
             self._send_json({"status": "error", "error": str(e)}, 500)
+
+    def _handle_discovery(self):
+        """Show full discovery state: which models are on which hosts."""
+        discovered = get_discovery()
+        cfg = load_config()
+
+        # Build reverse map: model -> capabilities
+        if _is_new_format(cfg):
+            cap_map = cfg["capabilities"]
+        else:
+            cap_map = {}
+            for model_name, info in cfg.get("models", {}).items():
+                for cap in info.get("capabilities", []):
+                    cap_map.setdefault(cap, []).append(model_name)
+
+        result = {}
+        for model, hosts in sorted(discovered.items()):
+            caps = [c for c, models in cap_map.items() if model in models]
+            result[model] = {
+                "hosts": [h["host"] for h in hosts],
+                "capabilities": caps if caps else ["untagged"],
+            }
+        self._send_json({
+            "models": result,
+            "last_discovery": _last_discovery,
+        })
 
     def _handle_chat(self):
         body = self._read_body()
@@ -234,7 +437,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         timeout = req.get("timeout", REQUEST_TIMEOUT)
 
         # Resolve: capability name or direct model name
-        backends = get_models_for_capability(model_field)
+        backends = resolve_capability(model_field)
         if not backends:
             backends = resolve_model_direct(model_field)
         if not backends:
@@ -250,7 +453,6 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             try:
                 print(f"[caproute] {model_field} -> {backend['name']}@{backend['host']}")
                 result = proxy_to_backend(backend, messages, params, timeout)
-                # Tag which backend actually served it
                 result["_caproute"] = {
                     "capability": model_field,
                     "model": backend["name"],
@@ -284,13 +486,25 @@ def main():
     # Verify config
     try:
         cfg = load_config()
+        hosts = _get_hosts(cfg)
         caps = get_capabilities()
-        print(f"[caproute] Config: {CONFIG_PATH}")
+        fmt = "new (capabilities)" if _is_new_format(cfg) else "legacy (models)"
+        print(f"[caproute] Config: {CONFIG_PATH} ({fmt})")
         print(f"[caproute] Capabilities: {', '.join(caps)}")
-        print(f"[caproute] Hosts: {', '.join(cfg['hosts'].keys())}")
+        print(f"[caproute] Hosts: {', '.join(hosts.keys())}")
     except Exception as e:
         print(f"[caproute] ERROR loading config: {e}")
         return 1
+
+    # Initial discovery
+    print(f"[caproute] Running initial discovery...")
+    discovered = run_discovery()
+    print(f"[caproute] Discovered {len(discovered)} models across hosts")
+
+    # Background discovery thread
+    t = threading.Thread(target=_discovery_loop, daemon=True)
+    t.start()
+    print(f"[caproute] Discovery refresh every {DISCOVERY_INTERVAL}s")
 
     server = http.server.HTTPServer(("0.0.0.0", args.port), CaprouteHandler)
     print(f"[caproute] Listening on http://0.0.0.0:{args.port}")
