@@ -1,0 +1,13 @@
+[Unit]
+Description=caproute — capability-routing LLM gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/caproute/caproute.py
+Restart=on-failure
+RestartSec=5
+Environment=CAPROUTE_PORT=8800
+
+[Install]
+WantedBy=default.target

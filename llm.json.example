@@ -1,0 +1,12 @@
+{
+  "models": {
+    "qwen2.5:32b":      { "capabilities": ["fast", "powerful"],             "hosts": ["server-a"] },
+    "qwen2.5:7b":       { "capabilities": ["fast", "adequate"],            "hosts": ["server-b", "server-a"] },
+    "gemma3:4b":         { "capabilities": ["fast", "adequate", "vision"],  "hosts": ["server-b"] },
+    "qwen3.5:27b":      { "capabilities": ["thinking"],                    "hosts": ["server-a"] }
+  },
+  "hosts": {
+    "server-a": { "base_url": "http://server-a.your-tailnet.ts.net:11434", "api": "ollama" },
+    "server-b": { "base_url": "http://localhost:11434",                      "api": "ollama" }
+  }
+}
