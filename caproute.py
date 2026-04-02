@@ -143,6 +143,27 @@ def _record_failure(key):
         _backend_state[key] = s
 
 
+def _record_idle(key):
+    """Record that a model is available but not loaded (Ollama idle)."""
+    with _backend_lock:
+        s = _backend_state.get(
+            key,
+            {
+                "latency_ms": 0,
+                "failures": 0,
+                "last_success": 0,
+                "last_probe": 0,
+                "in_flight": 0,
+                "avg_latency_ms": 500,
+                "status": "unknown",
+            },
+        )
+        s["status"] = "idle"
+        s["failures"] = 0
+        s["last_probe"] = time.time()
+        _backend_state[key] = s
+
+
 def _inc_in_flight(key):
     with _in_flight_lock:
         _in_flight[key] = _in_flight.get(key, 0) + 1
@@ -190,8 +211,11 @@ def backend_score(key):
     score += failures * 5000
     # Penalty for in-flight requests (prefer less loaded backends)
     score += in_flight * 3000
+    # Penalty for idle (available but not loaded — will need cold-start)
+    if status == "idle":
+        score += 10000
     # Small penalty for unknown status (prefer backends we've seen succeed)
-    if status == "unknown":
+    elif status == "unknown":
         score += 1000
 
     return score
@@ -301,6 +325,37 @@ def _get_loaded_models_ollama(base_url):
         return set()
 
 
+def _get_loaded_models_openai(base_url):
+    """Get models currently loaded on an OpenAI-compatible host (e.g. llama-server).
+    Returns (loaded, total) sets. If the server doesn't report status, all models
+    are assumed loaded (returns total, total)."""
+    try:
+        url = base_url.rstrip("/") + "/v1/models"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        loaded = set()
+        total = set()
+        has_status = False
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            total.add(mid)
+            status = m.get("status", {})
+            if isinstance(status, dict) and "value" in status:
+                has_status = True
+                if status["value"] == "loaded":
+                    loaded.add(mid)
+            else:
+                loaded.add(mid)
+        if not has_status:
+            return total, total
+        return loaded, total
+    except Exception:
+        return set(), set()
+
+
 def _probe_backend(backend):
     """Send a tiny probe request to a backend. Returns latency_ms or None on failure."""
     key = _backend_key(backend["host"], backend["name"])
@@ -354,8 +409,9 @@ def _probe_loop():
     For Ollama hosts: only probe models that are already loaded in memory
     (via /api/ps). This avoids loading models which evicts others.
 
-    For llama.cpp/OpenAI hosts: all configured models are pre-loaded,
-    so probe them all.
+    For Ollama hosts: only probe models loaded in memory (via /api/ps).
+    For OpenAI/llama.cpp hosts: only probe loaded models if the server
+    reports per-model status (via /v1/models status field).
 
     Skips backends with in-flight requests to avoid interference.
     """
@@ -369,11 +425,11 @@ def _probe_loop():
                 tagged_models.update(models)
             if "models" in cfg:
                 for model_name, info in cfg.get("models", {}).items():
-                    if any(
-                        c in info.get("capabilities", [])
-                        for c in ["fast", "adequate", "powerful", "style"]
-                    ):
+                    if info.get("capabilities"):
                         tagged_models.add(model_name)
+
+            # Pre-fetch loaded model sets per host (avoid repeated API calls)
+            _host_loaded_cache = {}
 
             backends_to_probe = []
             for model_name in tagged_models:
@@ -388,13 +444,20 @@ def _probe_loop():
                     if in_flight > 0 or age < PROBE_INTERVAL:
                         continue
 
-                    # For Ollama: only probe if model is already loaded
-                    if h["api"] == "ollama":
-                        loaded = _get_loaded_models_ollama(h["url"])
-                        if model_name not in loaded:
-                            # Model not loaded — mark as down without probing
-                            _record_failure(key)
-                            continue
+                    # Check if model is loaded (avoid probing unloaded models)
+                    host_key = (h["host"], h["api"], h["url"])
+                    if host_key not in _host_loaded_cache:
+                        if h["api"] == "ollama":
+                            loaded = _get_loaded_models_ollama(h["url"])
+                            _host_loaded_cache[host_key] = loaded
+                        else:
+                            loaded, _ = _get_loaded_models_openai(h["url"])
+                            _host_loaded_cache[host_key] = loaded
+
+                    loaded = _host_loaded_cache[host_key]
+                    if model_name not in loaded:
+                        _record_idle(key)
+                        continue
 
                     backends_to_probe.append(
                         {
@@ -449,6 +512,16 @@ def _get_hosts(cfg):
     return hosts
 
 
+# Default fallback chain: each capability falls back to the one above it (higher quality).
+# Config can override with a "fallbacks" key.
+DEFAULT_FALLBACKS = {
+    "fast": "adequate",
+    "adequate": "powerful",
+    "powerful": "thinking",
+    "style": "adequate",
+}
+
+
 def get_capabilities():
     cfg = load_config()
     if _is_new_format(cfg):
@@ -457,6 +530,13 @@ def get_capabilities():
     for info in cfg.get("models", {}).values():
         caps.update(info.get("capabilities", []))
     return sorted(caps)
+
+
+def _get_fallbacks(cfg):
+    """Get fallback chain from config, merged with defaults."""
+    fallbacks = dict(DEFAULT_FALLBACKS)
+    fallbacks.update(cfg.get("fallbacks", {}))
+    return fallbacks
 
 
 def _get_capability_models(cfg, capability):
@@ -478,11 +558,8 @@ def _get_all_tagged_models(cfg):
     return set(cfg.get("models", {}).keys())
 
 
-def resolve_capability(capability):
-    """
-    Resolve a capability to an ordered list of backends, sorted by
-    real-time probe scores. Best (lowest score) first.
-    """
+def _resolve_capability_backends(capability):
+    """Resolve a capability to backends sorted by probe score. Returns empty list if none available."""
     cfg = load_config()
     model_list = _get_capability_models(cfg, capability)
     if not model_list:
@@ -522,9 +599,47 @@ def resolve_capability(capability):
                 }
             )
 
-    # Sort by probe score: best first
     backends.sort(key=lambda b: b["_score"])
     return backends
+
+
+def _has_healthy_backend(backends):
+    """Check if any backend in the list is not down (score < 999999)."""
+    return any(b["_score"] < 999999 for b in backends)
+
+
+def resolve_capability(capability):
+    """
+    Resolve a capability to backends sorted by probe score.
+    If all backends are down, follows the fallback chain upward to higher-quality
+    categories until a healthy backend is found.
+    Returns (backends, actual_capability) tuple.
+    """
+    backends = _resolve_capability_backends(capability)
+    actual_cap = capability
+
+    if backends and not _has_healthy_backend(backends):
+        # All backends for this capability are down — try fallback chain
+        cfg = load_config()
+        fallbacks = _get_fallbacks(cfg)
+        chain = []
+        current = capability
+        visited = set()
+        while current in fallbacks and current not in visited:
+            visited.add(current)
+            next_cap = fallbacks[current]
+            chain.append(next_cap)
+            current = next_cap
+
+        for fallback_cap in chain:
+            fb_backends = _resolve_capability_backends(fallback_cap)
+            if fb_backends and _has_healthy_backend(fb_backends):
+                backends = fb_backends
+                actual_cap = fallback_cap
+                print(f"[caproute] fallback: {capability} -> {actual_cap}")
+                break
+
+    return backends, actual_cap
 
 
 def resolve_model_direct(model_name):
@@ -545,7 +660,7 @@ def resolve_model_direct(model_name):
                 }
             )
         result.sort(key=lambda b: b["_score"])
-        return result
+        return result, model_name
 
     cfg = load_config()
     if not _is_new_format(cfg) and model_name in cfg.get("models", {}):
@@ -565,9 +680,9 @@ def resolve_model_direct(model_name):
                     }
                 )
         result.sort(key=lambda b: b["_score"])
-        return result
+        return result, model_name
 
-    return []
+    return [], model_name
 
 
 # ── Backend requests ─────────────────────────────────────────────────
@@ -808,9 +923,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         timeout = req.get("timeout", default_timeout)
 
         # Resolve: capability name or direct model name
-        backends = resolve_capability(model_field)
+        backends, actual_cap = resolve_capability(model_field)
         if not backends:
-            backends = resolve_model_direct(model_field)
+            backends, _ = resolve_model_direct(model_field)
         if not backends:
             self._send_json(
                 {
@@ -837,7 +952,8 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 latency_ms = (time.time() - t0) * 1000
                 _record_success(key, latency_ms)
                 result["_caproute"] = {
-                    "capability": model_field,
+                    "capability": actual_cap,
+                    "requested": model_field,
                     "model": backend["name"],
                     "host": backend["host"],
                     "latency_ms": round(latency_ms),
