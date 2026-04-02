@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import http.server
 import json
 import os
@@ -39,7 +40,9 @@ DEFAULT_PORT = int(os.environ.get("CAPROUTE_PORT", "8800"))
 REQUEST_TIMEOUT = int(os.environ.get("CAPROUTE_TIMEOUT", "60"))
 DISCOVERY_INTERVAL = int(os.environ.get("CAPROUTE_DISCOVERY_INTERVAL", "60"))
 PROBE_INTERVAL = int(os.environ.get("CAPROUTE_PROBE_INTERVAL", "5"))
-PROBE_TIMEOUT = int(os.environ.get("CAPROUTE_PROBE_TIMEOUT", "8"))
+PROBE_TIMEOUT = int(os.environ.get("CAPROUTE_PROBE_TIMEOUT", "60"))
+IDLE_PROBE_INTERVAL = int(os.environ.get("CAPROUTE_IDLE_PROBE_INTERVAL", "60"))
+DOWN_RETRY_INTERVAL = int(os.environ.get("CAPROUTE_DOWN_RETRY_INTERVAL", "30"))
 
 # ── Discovery cache ──────────────────────────────────────────────────
 # Maps model_name -> [{"host": name, "url": base_url, "api": type}, ...]
@@ -120,7 +123,10 @@ def _record_success(key, latency_ms):
 
 
 def _record_failure(key):
-    """Record a failed request or probe."""
+    """Record a failed request or probe.
+    Uses exponential backoff: backends marked 'down' are retried periodically
+    instead of being permanently dead.
+    """
     with _backend_lock:
         s = _backend_state.get(
             key,
@@ -136,11 +142,22 @@ def _record_failure(key):
         )
         s["failures"] = s.get("failures", 0) + 1
         s["last_probe"] = time.time()
+        # After 3 failures mark as down, but still retry periodically
         if s["failures"] >= 3:
             s["status"] = "down"
         else:
             s["status"] = "slow"
         _backend_state[key] = s
+
+
+def _should_retry_down(key):
+    """Check if a down backend should be retried (every 30 seconds)."""
+    with _backend_lock:
+        s = _backend_state.get(key, {})
+    if s.get("status") != "down":
+        return True
+    last_probe = s.get("last_probe", 0)
+    return (time.time() - last_probe) >= DOWN_RETRY_INTERVAL
 
 
 def _record_idle(key):
@@ -184,7 +201,7 @@ def backend_score(key):
     """
     Score for routing. Lower = better.
     Combines: avg latency, consecutive failures, in-flight count.
-    Down backends get a very high score so they're tried last.
+    Down backends get a high score but are still tried (not permanently dead).
     """
     with _backend_lock:
         s = _backend_state.get(
@@ -198,8 +215,6 @@ def backend_score(key):
         )
 
     status = s.get("status", "unknown")
-    if status == "down":
-        return 999999
 
     failures = s.get("failures", 0)
     avg_lat = s.get("avg_latency_ms", 500)
@@ -214,6 +229,9 @@ def backend_score(key):
     # Penalty for idle (available but not loaded — will need cold-start)
     if status == "idle":
         score += 10000
+    # Penalty for down (recently failed — try last but don't skip entirely)
+    elif status == "down":
+        score += 50000
     # Small penalty for unknown status (prefer backends we've seen succeed)
     elif status == "unknown":
         score += 1000
@@ -327,8 +345,24 @@ def _get_loaded_models_ollama(base_url):
 
 def _get_loaded_models_openai(base_url):
     """Get models currently loaded on an OpenAI-compatible host (e.g. llama-server).
-    Returns (loaded, total) sets. If the server doesn't report status, all models
-    are assumed loaded (returns total, total)."""
+    Tries /api/ps first (for hosts that implement Ollama-compatible ps endpoint),
+    falls back to /v1/models status check, then to assuming all models are loaded.
+    Returns (loaded, total) sets."""
+    try:
+        url = base_url.rstrip("/") + "/api/ps"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        loaded = set()
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            if name:
+                loaded.add(name)
+        if loaded:
+            return loaded, loaded
+    except Exception:
+        pass
+
     try:
         url = base_url.rstrip("/") + "/v1/models"
         req = urllib.request.Request(url, method="GET")
@@ -406,12 +440,11 @@ def _probe_loop():
     """
     Continuously probe backends to track real-time health.
 
-    For Ollama hosts: only probe models that are already loaded in memory
-    (via /api/ps). This avoids loading models which evicts others.
+    Only probe models that are loaded in memory (via /api/ps for Ollama).
+    Idle (not loaded) models are skipped — actual requests will trigger
+    cold-start loading if needed.
 
-    For Ollama hosts: only probe models loaded in memory (via /api/ps).
-    For OpenAI/llama.cpp hosts: only probe loaded models if the server
-    reports per-model status (via /v1/models status field).
+    Down backends are retried periodically with exponential backoff.
 
     Skips backends with in-flight requests to avoid interference.
     """
@@ -440,11 +473,20 @@ def _probe_loop():
                     in_flight = state.get("in_flight", 0)
                     last_probe = state.get("last_probe", 0)
                     age = time.time() - last_probe
+                    status = state.get("status", "unknown")
 
-                    if in_flight > 0 or age < PROBE_INTERVAL:
+                    if in_flight > 0:
                         continue
 
-                    # Check if model is loaded (avoid probing unloaded models)
+                    # Down backends: retry with exponential backoff
+                    if status == "down" and not _should_retry_down(key):
+                        continue
+
+                    # Skip recently probed healthy backends
+                    if status in ("ok", "slow") and age < PROBE_INTERVAL:
+                        continue
+
+                    # Check if model is loaded
                     host_key = (h["host"], h["api"], h["url"])
                     if host_key not in _host_loaded_cache:
                         if h["api"] == "ollama":
@@ -456,6 +498,8 @@ def _probe_loop():
 
                     loaded = _host_loaded_cache[host_key]
                     if model_name not in loaded:
+                        # Model not loaded — mark as idle, skip probing
+                        # Actual requests will handle cold-start
                         _record_idle(key)
                         continue
 
@@ -470,11 +514,12 @@ def _probe_loop():
 
             for backend in backends_to_probe:
                 latency = _probe_backend(backend)
-                status = "ok" if latency else "down"
                 key = _backend_key(backend["host"], backend["name"])
+                state = _get_backend_state(key)
+                status = state.get("status", "unknown")
                 if latency:
                     print(
-                        f"[probe] {backend['name']}@{backend['host']}: {status} ({latency:.0f}ms)"
+                        f"[probe] {backend['name']}@{backend['host']}: ok ({latency:.0f}ms)"
                     )
                 else:
                     print(f"[probe] {backend['name']}@{backend['host']}: {status}")
@@ -688,6 +733,43 @@ def resolve_model_direct(model_name):
 # ── Backend requests ─────────────────────────────────────────────────
 
 
+def _extract_content(result):
+    """Extract text content from a chat completion response.
+    Handles reasoning models that output to 'reasoning_content' (OpenAI format)
+    or 'reasoning' (Ollama format) instead of 'content'.
+    """
+    # DEBUG
+    print(f"[DEBUG _extract_content] result keys: {result.keys()}")
+    # OpenAI format
+    choices = result.get("choices", [])
+    if choices:
+        msg = choices[0].get("message", {})
+        print(f"[DEBUG _extract_content] msg keys: {msg.keys()}")
+        content = msg.get("content", "")
+        if content:
+            return content
+        # Fallback: reasoning models put output in reasoning_content (OpenAI),
+        # reasoning (OpenAI-compat Ollama), or thinking (native Ollama)
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            reasoning = msg.get(key, "")
+            if reasoning:
+                print(
+                    f"[DEBUG _extract_content] found reasoning via key={key}, len={len(reasoning)}"
+                )
+                return reasoning
+    # Ollama format (wrapped by _proxy_ollama)
+    msg = result.get("message", {})
+    if msg:
+        content = msg.get("content", "")
+        if content:
+            return content
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            reasoning = msg.get(key, "")
+            if reasoning:
+                return reasoning
+    return ""
+
+
 def _proxy_ollama(base_url, model, messages, params, timeout):
     url = base_url.rstrip("/") + "/api/chat"
     data = {
@@ -710,7 +792,7 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read())
 
-    content = result.get("message", {}).get("content", "")
+    content = _extract_content(result)
     return _wrap_openai_response(model, content)
 
 
@@ -733,7 +815,10 @@ def _proxy_openai(base_url, model, messages, params, timeout):
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+        result = json.loads(resp.read())
+
+    content = _extract_content(result)
+    return _wrap_openai_response(model, content)
 
 
 def _wrap_openai_response(model, content):
@@ -773,12 +858,15 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected, nothing to do
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1025,9 +1113,32 @@ def main():
     p.start()
     print(f"[caproute] Probe interval: {PROBE_INTERVAL}s, timeout: {PROBE_TIMEOUT}s")
 
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), CaprouteHandler)
-    server.daemon_threads = True
-    print(f"[caproute] Listening on http://0.0.0.0:{args.port} (probe-routing mode)")
+    class PooledHTTPServer(http.server.HTTPServer):
+        """HTTPServer that dispatches requests to a bounded thread pool."""
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+        daemon_threads = True
+
+        def process_request(self, request, client_address):
+            self.pool.submit(self.process_request_thread, request, client_address)
+
+        def process_request_thread(self, request, client_address):
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+
+        def handle_error(self, request, client_address):
+            # Suppress noisy broken pipe / connection reset errors
+            import traceback, sys
+            _, exc, _ = sys.exc_info()
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, OSError)):
+                return
+            traceback.print_exc()
+
+    server = PooledHTTPServer(("0.0.0.0", args.port), CaprouteHandler)
+    print(f"[caproute] Listening on http://0.0.0.0:{args.port} (probe-routing, 32 workers)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
