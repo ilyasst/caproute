@@ -734,40 +734,42 @@ def resolve_model_direct(model_name):
 
 
 def _extract_content(result):
-    """Extract text content from a chat completion response.
-    Handles reasoning models that output to 'reasoning_content' (OpenAI format)
-    or 'reasoning' (Ollama format) instead of 'content'.
-    """
+    """Extract text content and tool_calls from a chat completion response."""
     # DEBUG
     print(f"[DEBUG _extract_content] result keys: {result.keys()}")
+
+    tool_calls = None
+
     # OpenAI format
     choices = result.get("choices", [])
     if choices:
         msg = choices[0].get("message", {})
         print(f"[DEBUG _extract_content] msg keys: {msg.keys()}")
+        tool_calls = msg.get("tool_calls")
         content = msg.get("content", "")
-        if content:
-            return content
-        # Fallback: reasoning models put output in reasoning_content (OpenAI),
-        # reasoning (OpenAI-compat Ollama), or thinking (native Ollama)
+        if content or tool_calls:
+            return content, tool_calls
+        # Fallback: reasoning models
         for key in ("reasoning_content", "reasoning", "thinking"):
             reasoning = msg.get(key, "")
             if reasoning:
                 print(
                     f"[DEBUG _extract_content] found reasoning via key={key}, len={len(reasoning)}"
                 )
-                return reasoning
+                return reasoning, tool_calls
+
     # Ollama format (wrapped by _proxy_ollama)
     msg = result.get("message", {})
     if msg:
+        tool_calls = msg.get("tool_calls")
         content = msg.get("content", "")
-        if content:
-            return content
+        if content or tool_calls:
+            return content, tool_calls
         for key in ("reasoning_content", "reasoning", "thinking"):
             reasoning = msg.get(key, "")
             if reasoning:
-                return reasoning
-    return ""
+                return reasoning, tool_calls
+    return "", tool_calls
 
 
 def _proxy_ollama(base_url, model, messages, params, timeout):
@@ -782,6 +784,8 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
         data["options"]["temperature"] = params["temperature"]
     if params.get("max_tokens") is not None:
         data["options"]["num_predict"] = params["max_tokens"]
+    if params.get("tools") is not None:
+        data["tools"] = params["tools"]
 
     req = urllib.request.Request(
         url,
@@ -792,8 +796,8 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read())
 
-    content = _extract_content(result)
-    return _wrap_openai_response(model, content)
+    content, tool_calls = _extract_content(result)
+    return _wrap_openai_response(model, content, tool_calls)
 
 
 def _proxy_openai(base_url, model, messages, params, timeout):
@@ -807,6 +811,15 @@ def _proxy_openai(base_url, model, messages, params, timeout):
         data["temperature"] = params["temperature"]
     if params.get("max_tokens") is not None:
         data["max_tokens"] = params["max_tokens"]
+    for key in [
+        "tools",
+        "tool_choice",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+    ]:
+        if params.get(key) is not None:
+            data[key] = params[key]
 
     req = urllib.request.Request(
         url,
@@ -817,11 +830,20 @@ def _proxy_openai(base_url, model, messages, params, timeout):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read())
 
-    content = _extract_content(result)
-    return _wrap_openai_response(model, content)
+    content, tool_calls = _extract_content(result)
+    return _wrap_openai_response(model, content, tool_calls)
 
 
-def _wrap_openai_response(model, content):
+def _wrap_openai_response(model, content, tool_calls=None):
+    message = {"role": "assistant"}
+    if content:
+        message["content"] = content
+    else:
+        message["content"] = ""
+
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
     return {
         "id": f"caproute-{int(time.time())}",
         "object": "chat.completion",
@@ -830,8 +852,8 @@ def _wrap_openai_response(model, content):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -867,6 +889,41 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass  # client disconnected, nothing to do
+
+    def _send_sse(self, result):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            content = (
+                result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            )
+
+            chunk = {
+                "id": result.get("id", "caproute-stream"),
+                "object": "chat.completion.chunk",
+                "created": result.get("created", int(time.time())),
+                "model": result.get("model", "unknown"),
+                "choices": [
+                    {"index": 0, "delta": {"content": content}, "finish_reason": None}
+                ],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+
+            final_chunk = {
+                "id": result.get("id", "caproute-stream"),
+                "object": "chat.completion.chunk",
+                "created": result.get("created", int(time.time())),
+                "model": result.get("model", "unknown"),
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1001,10 +1058,17 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             return
 
         params = {}
-        if "temperature" in req:
-            params["temperature"] = req["temperature"]
-        if "max_tokens" in req:
-            params["max_tokens"] = req["max_tokens"]
+        for key in [
+            "temperature",
+            "max_tokens",
+            "tools",
+            "tool_choice",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+        ]:
+            if key in req:
+                params[key] = req[key]
 
         cfg = load_config()
         default_timeout = _get_timeout(cfg, model_field)
@@ -1012,6 +1076,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
 
         # Resolve: capability name or direct model name
         backends, actual_cap = resolve_capability(model_field)
+
+        # If the user explicitly requested "thinking" and no backends are healthy,
+        # DO NOT fall back to direct model names or return error immediately.
+        # Keep the actual backends (even if slow) so proxy_to_backend can wait for them.
+        if actual_cap == "thinking" and not _has_healthy_backend(backends):
+            backends = _resolve_capability_backends("thinking")
+
         if not backends:
             backends, _ = resolve_model_direct(model_field)
         if not backends:
@@ -1047,7 +1118,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     "latency_ms": round(latency_ms),
                     "score": round(backend["_score"]),
                 }
-                self._send_json(result)
+                if req.get("stream", False):
+                    self._send_sse(result)
+                else:
+                    self._send_json(result)
                 return
             except Exception as e:
                 _record_failure(key)
@@ -1115,6 +1189,7 @@ def main():
 
     class PooledHTTPServer(http.server.HTTPServer):
         """HTTPServer that dispatches requests to a bounded thread pool."""
+
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
         daemon_threads = True
 
@@ -1132,13 +1207,16 @@ def main():
         def handle_error(self, request, client_address):
             # Suppress noisy broken pipe / connection reset errors
             import traceback, sys
+
             _, exc, _ = sys.exc_info()
             if isinstance(exc, (BrokenPipeError, ConnectionResetError, OSError)):
                 return
             traceback.print_exc()
 
     server = PooledHTTPServer(("0.0.0.0", args.port), CaprouteHandler)
-    print(f"[caproute] Listening on http://0.0.0.0:{args.port} (probe-routing, 32 workers)")
+    print(
+        f"[caproute] Listening on http://0.0.0.0:{args.port} (probe-routing, 32 workers)"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
