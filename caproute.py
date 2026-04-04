@@ -345,24 +345,10 @@ def _get_loaded_models_ollama(base_url):
 
 def _get_loaded_models_openai(base_url):
     """Get models currently loaded on an OpenAI-compatible host (e.g. llama-server).
-    Tries /api/ps first (for hosts that implement Ollama-compatible ps endpoint),
-    falls back to /v1/models status check, then to assuming all models are loaded.
+    Queries /v1/models and checks each model's status field.
+    Models with status.value == "loaded" are considered loaded.
+    If no status fields are present, falls back to assuming all models are loaded.
     Returns (loaded, total) sets."""
-    try:
-        url = base_url.rstrip("/") + "/api/ps"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        loaded = set()
-        for m in data.get("models", []):
-            name = m.get("name", "")
-            if name:
-                loaded.add(name)
-        if loaded:
-            return loaded, loaded
-    except Exception:
-        pass
-
     try:
         url = base_url.rstrip("/") + "/v1/models"
         req = urllib.request.Request(url, method="GET")
@@ -382,8 +368,10 @@ def _get_loaded_models_openai(base_url):
                 if status["value"] == "loaded":
                     loaded.add(mid)
             else:
+                # No status field on this model — assume loaded (backwards compat)
                 loaded.add(mid)
         if not has_status:
+            # No model had a status field — assume all are loaded (generic OpenAI API)
             return total, total
         return loaded, total
     except Exception:
