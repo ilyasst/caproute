@@ -222,16 +222,18 @@ def backend_score(key):
 
     # Base score from latency
     score = avg_lat
-    # Penalty for consecutive failures
-    score += failures * 5000
+    # Penalty for consecutive failures, capped at 6 failures (30k max)
+    # so transient outages don't permanently exclude backends
+    score += min(failures, 6) * 5000
     # Penalty for in-flight requests (prefer less loaded backends)
     score += in_flight * 3000
     # Penalty for idle (available but not loaded — will need cold-start)
     if status == "idle":
         score += 10000
     # Penalty for down (recently failed — try last but don't skip entirely)
+    # Reduced from 50000 to 15000 so recovered backends re-enter rotation faster
     elif status == "down":
-        score += 50000
+        score += 15000
     # Small penalty for unknown status (prefer backends we've seen succeed)
     elif status == "unknown":
         score += 1000
