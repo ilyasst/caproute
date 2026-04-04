@@ -898,27 +898,48 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            content = (
-                result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            )
+            msg = result.get("choices", [{}])[0].get("message", {})
+            content = msg.get("content", "")
+            tool_calls = msg.get("tool_calls")
+            finish_reason = result.get("choices", [{}])[0].get("finish_reason", "stop")
 
-            chunk = {
+            chunk_base = {
                 "id": result.get("id", "caproute-stream"),
                 "object": "chat.completion.chunk",
                 "created": result.get("created", int(time.time())),
                 "model": result.get("model", "unknown"),
-                "choices": [
-                    {"index": 0, "delta": {"content": content}, "finish_reason": None}
-                ],
             }
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+
+            # Send content chunk if present
+            if content:
+                content_chunk = {
+                    **chunk_base,
+                    "choices": [
+                        {"index": 0, "delta": {"content": content}, "finish_reason": None}
+                    ],
+                }
+                self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+
+            # Send tool_calls as streaming deltas
+            if tool_calls:
+                for i, tc in enumerate(tool_calls):
+                    tc_delta = {
+                        "index": i,
+                        "id": tc.get("id", f"call_{i}"),
+                        "type": "function",
+                        "function": tc.get("function", {}),
+                    }
+                    tc_chunk = {
+                        **chunk_base,
+                        "choices": [
+                            {"index": 0, "delta": {"tool_calls": [tc_delta]}, "finish_reason": None}
+                        ],
+                    }
+                    self.wfile.write(f"data: {json.dumps(tc_chunk)}\n\n".encode())
 
             final_chunk = {
-                "id": result.get("id", "caproute-stream"),
-                "object": "chat.completion.chunk",
-                "created": result.get("created", int(time.time())),
-                "model": result.get("model", "unknown"),
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                **chunk_base,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
             }
             self.wfile.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
@@ -1074,62 +1095,82 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         default_timeout = _get_timeout(cfg, model_field)
         timeout = req.get("timeout", default_timeout)
 
-        # Resolve: capability name or direct model name
-        backends, actual_cap = resolve_capability(model_field)
-
-        # If the user explicitly requested "thinking" and no backends are healthy,
-        # DO NOT fall back to direct model names or return error immediately.
-        # Keep the actual backends (even if slow) so proxy_to_backend can wait for them.
-        if actual_cap == "thinking" and not _has_healthy_backend(backends):
-            backends = _resolve_capability_backends("thinking")
-
-        if not backends:
-            backends, _ = resolve_model_direct(model_field)
-        if not backends:
-            self._send_json(
-                {
-                    "error": f"unknown capability or model: '{model_field}'",
-                    "available": get_capabilities(),
-                },
-                400,
-            )
-            return
-
-        # Try each backend in score order (best first).
-        # Use the full timeout per backend since we already know which ones are alive
-        # from probing — no need to split timeout across backends.
+        current_cap = model_field
         errors = []
-        for backend in backends:
-            key = _backend_key(backend["host"], backend["name"])
-            _inc_in_flight(key)
-            try:
-                t0 = time.time()
-                print(
-                    f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f})"
-                )
-                result = proxy_to_backend(backend, messages, params, timeout)
-                latency_ms = (time.time() - t0) * 1000
-                _record_success(key, latency_ms)
-                result["_caproute"] = {
-                    "capability": actual_cap,
-                    "requested": model_field,
-                    "model": backend["name"],
-                    "host": backend["host"],
-                    "latency_ms": round(latency_ms),
-                    "score": round(backend["_score"]),
-                }
-                if req.get("stream", False):
-                    self._send_sse(result)
+        visited_caps = set()
+
+        while True:
+            visited_caps.add(current_cap)
+            
+            # Resolve: capability name or direct model name
+            backends, actual_cap = resolve_capability(current_cap)
+
+            # If the user explicitly requested "thinking" and no backends are healthy,
+            # DO NOT fall back to direct model names or return error immediately.
+            # Keep the actual backends (even if slow) so proxy_to_backend can wait for them.
+            if actual_cap == "thinking" and not _has_healthy_backend(backends) and current_cap == model_field:
+                backends = _resolve_capability_backends("thinking")
+
+            if not backends and current_cap == model_field:
+                backends, _ = resolve_model_direct(model_field)
+                
+            if not backends:
+                if current_cap == model_field:
+                    self._send_json(
+                        {
+                            "error": f"unknown capability or model: '{model_field}'",
+                            "available": get_capabilities(),
+                        },
+                        400,
+                    )
+                    return
                 else:
-                    self._send_json(result)
-                return
-            except Exception as e:
-                _record_failure(key)
-                err = f"{backend['name']}@{backend['host']}: {e}"
-                print(f"[caproute] FAIL {err}")
-                errors.append(err)
-            finally:
-                _dec_in_flight(key)
+                    break
+
+            # Try each backend in score order (best first).
+            # Use the full timeout per backend since we already know which ones are alive
+            # from probing — no need to split timeout across backends.
+            for backend in backends:
+                key = _backend_key(backend["host"], backend["name"])
+                _inc_in_flight(key)
+                try:
+                    t0 = time.time()
+                    print(
+                        f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f})"
+                    )
+                    result = proxy_to_backend(backend, messages, params, timeout)
+                    latency_ms = (time.time() - t0) * 1000
+                    _record_success(key, latency_ms)
+                    result["_caproute"] = {
+                        "capability": actual_cap,
+                        "requested": model_field,
+                        "model": backend["name"],
+                        "host": backend["host"],
+                        "latency_ms": round(latency_ms),
+                        "score": round(backend["_score"]),
+                    }
+                    if req.get("stream", False):
+                        self._send_sse(result)
+                    else:
+                        self._send_json(result)
+                    return
+                except Exception as e:
+                    _record_failure(key)
+                    err = f"{backend['name']}@{backend['host']}: {e}"
+                    print(f"[caproute] FAIL {err}")
+                    errors.append(err)
+                finally:
+                    _dec_in_flight(key)
+
+            # All backends failed for the current batch. Try to fall back.
+            cfg = load_config()
+            fallbacks = _get_fallbacks(cfg)
+            if actual_cap in fallbacks and fallbacks[actual_cap] not in visited_caps:
+                current_cap = fallbacks[actual_cap]
+                print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}...")
+                continue
+            else:
+                break
 
         self._send_json(
             {
