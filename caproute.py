@@ -923,11 +923,19 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             # Send tool_calls as streaming deltas
             if tool_calls:
                 for i, tc in enumerate(tool_calls):
+                    fn = tc.get("function", {})
+                    # OpenAI streaming spec requires arguments as a JSON string
+                    args = fn.get("arguments", "")
+                    if not isinstance(args, str):
+                        args = json.dumps(args)
                     tc_delta = {
                         "index": i,
                         "id": tc.get("id", f"call_{i}"),
                         "type": "function",
-                        "function": tc.get("function", {}),
+                        "function": {
+                            "name": fn.get("name", ""),
+                            "arguments": args,
+                        },
                     }
                     tc_chunk = {
                         **chunk_base,
