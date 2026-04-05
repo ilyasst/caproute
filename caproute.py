@@ -28,6 +28,7 @@ import concurrent.futures
 import http.server
 import json
 import os
+import sqlite3
 import threading
 import time
 import urllib.request
@@ -107,7 +108,7 @@ def normalize_model_name(name):
 
 
 def _record_request(model, host, capability, latency_ms, success):
-    """Append a request record to the history ring buffer."""
+    """Append a request record to the ring buffer and persistent SQLite store."""
     entry = {
         "ts": time.time(),
         "model": normalize_model_name(model),
@@ -118,6 +119,131 @@ def _record_request(model, host, capability, latency_ms, success):
     }
     with _history_lock:
         _request_history.append(entry)
+    _db_record_request(entry)
+
+
+# ── Persistent history (SQLite, 14-day retention) ─────────────────────
+#
+# The ring buffer above stays in-memory for fast dashboard access. SQLite
+# adds durability across restarts and enables historical queries beyond
+# the 2000-entry buffer. Retention window is pruned hourly.
+
+_DB_PATH = os.environ.get(
+    "CAPROUTE_DB_PATH",
+    os.path.expanduser("~/.local/state/caproute/history.db"),
+)
+_DB_RETENTION_DAYS = int(os.environ.get("CAPROUTE_DB_RETENTION_DAYS", "14"))
+_DB_PRUNE_INTERVAL = 3600  # seconds — hourly
+_db_conn = None
+_db_lock = threading.Lock()
+
+
+def _db_init():
+    """Open DB, create schema, apply pragmas. Safe to call multiple times."""
+    global _db_conn
+    if _db_conn is not None:
+        return
+    try:
+        os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+        _db_conn = sqlite3.connect(_DB_PATH, check_same_thread=False, isolation_level=None)
+        _db_conn.execute("PRAGMA journal_mode=WAL")
+        _db_conn.execute("PRAGMA synchronous=NORMAL")
+        _db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS requests (
+                ts REAL NOT NULL,
+                model TEXT NOT NULL,
+                host TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                ok INTEGER NOT NULL
+            )
+            """
+        )
+        _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)")
+    except Exception as e:
+        print(f"[caproute] db init failed ({_DB_PATH}): {e}")
+        _db_conn = None
+
+
+def _db_record_request(entry):
+    """Persist a single request. Fire-and-forget, never raises."""
+    if _db_conn is None:
+        return
+    try:
+        with _db_lock:
+            _db_conn.execute(
+                "INSERT INTO requests(ts,model,host,capability,latency_ms,ok) VALUES (?,?,?,?,?,?)",
+                (
+                    entry["ts"],
+                    entry["model"],
+                    entry["host"],
+                    entry["capability"],
+                    entry["latency_ms"],
+                    1 if entry["ok"] else 0,
+                ),
+            )
+    except Exception as e:
+        print(f"[caproute] db write failed: {e}")
+
+
+def _db_load_recent(limit=2000):
+    """Return most recent N entries, oldest-first (for ring buffer repopulation)."""
+    if _db_conn is None:
+        return []
+    try:
+        with _db_lock:
+            cur = _db_conn.execute(
+                "SELECT ts,model,host,capability,latency_ms,ok FROM requests ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cur.fetchall()
+        return [
+            {"ts": r[0], "model": r[1], "host": r[2], "capability": r[3],
+             "latency_ms": r[4], "ok": bool(r[5])}
+            for r in reversed(rows)
+        ]
+    except Exception as e:
+        print(f"[caproute] db load failed: {e}")
+        return []
+
+
+def _db_query_since(since):
+    """Return all entries with ts > since, oldest-first."""
+    if _db_conn is None:
+        return []
+    try:
+        with _db_lock:
+            cur = _db_conn.execute(
+                "SELECT ts,model,host,capability,latency_ms,ok FROM requests WHERE ts > ? ORDER BY ts",
+                (since,),
+            )
+            rows = cur.fetchall()
+        return [
+            {"ts": r[0], "model": r[1], "host": r[2], "capability": r[3],
+             "latency_ms": r[4], "ok": bool(r[5])}
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[caproute] db query failed: {e}")
+        return []
+
+
+def _db_prune_loop():
+    """Hourly: delete entries older than retention window."""
+    while True:
+        time.sleep(_DB_PRUNE_INTERVAL)
+        if _db_conn is None:
+            continue
+        try:
+            cutoff = time.time() - (_DB_RETENTION_DAYS * 86400)
+            with _db_lock:
+                cur = _db_conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
+                deleted = cur.rowcount
+            if deleted > 0:
+                print(f"[caproute] pruned {deleted} history rows older than {_DB_RETENTION_DAYS}d")
+        except Exception as e:
+            print(f"[caproute] prune failed: {e}")
 
 
 def _backend_key(host, model):
@@ -1822,10 +1948,11 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         since = float(part.split("=", 1)[1])
                     except ValueError:
                         pass
-        with _history_lock:
-            if since:
-                records = [r for r in _request_history if r["ts"] > since]
-            else:
+        if since:
+            # Historical queries hit SQLite for durability + beyond-ring-buffer range.
+            records = _db_query_since(since)
+        else:
+            with _history_lock:
                 records = list(_request_history)
         self._send_json({"history": records, "count": len(records)})
 
@@ -2005,6 +2132,17 @@ def main():
     except Exception as e:
         print(f"[caproute] ERROR loading config: {e}")
         return 1
+
+    # Initialize persistent history store + rehydrate ring buffer
+    _db_init()
+    if _db_conn is not None:
+        recent = _db_load_recent(limit=_request_history.maxlen)
+        with _history_lock:
+            _request_history.extend(recent)
+        print(f"[caproute] DB: {_DB_PATH} (retention {_DB_RETENTION_DAYS}d, loaded {len(recent)} recent entries)")
+        threading.Thread(target=_db_prune_loop, daemon=True).start()
+    else:
+        print(f"[caproute] DB: disabled (init failed)")
 
     # Initial discovery
     print(f"[caproute] Running initial discovery...")
