@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import collections
 import concurrent.futures
 import http.server
 import json
@@ -67,6 +68,24 @@ _backend_lock = threading.Lock()
 # ── Concurrency tracking ─────────────────────────────────────────────
 _in_flight_lock = threading.Lock()
 _in_flight = {}  # "host:model" -> int
+
+# ── Request history (ring buffer for dashboard charts) ───────────────
+_request_history = collections.deque(maxlen=2000)
+_history_lock = threading.Lock()
+
+
+def _record_request(model, host, capability, latency_ms, success):
+    """Append a request record to the history ring buffer."""
+    entry = {
+        "ts": time.time(),
+        "model": model,
+        "host": host,
+        "capability": capability,
+        "latency_ms": round(latency_ms),
+        "ok": success,
+    }
+    with _history_lock:
+        _request_history.append(entry)
 
 
 def _backend_key(host, model):
@@ -386,48 +405,68 @@ def _get_loaded_models_openai(base_url):
         return set(), set()
 
 
-def _probe_backend(backend):
-    """Send a tiny probe request to a backend. Returns latency_ms or None on failure."""
+def _passive_health_check_openai(backend):
+    """Check llama-server health via /slots (no inference). Returns latency_ms or None.
+
+    This is a cheap HTTP GET that returns slot state. Much lighter than sending
+    a real "hi" inference probe — uses zero model compute.
+    """
     key = _backend_key(backend["host"], backend["name"])
     try:
         t0 = time.time()
-        if backend["api"] == "ollama":
-            url = backend["base_url"].rstrip("/") + "/api/chat"
-            data = {
-                "model": backend["name"],
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-                "options": {"num_predict": 5},
-            }
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(data).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
-                json.loads(resp.read())
-        else:
-            url = backend["base_url"].rstrip("/") + "/v1/chat/completions"
-            data = {
-                "model": backend["name"],
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-                "max_tokens": 5,
-            }
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(data).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
-                json.loads(resp.read())
-
+        url = backend["base_url"].rstrip("/") + "/slots"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read()
+            # llama-server returns a JSON array of slot dicts
+            # Some proxies may transform this — tolerate both
+            try:
+                slots = json.loads(body)
+            except Exception:
+                slots = None
         latency_ms = (time.time() - t0) * 1000
         _record_success(key, latency_ms)
         return latency_ms
-    except Exception as e:
+    except Exception:
+        _record_failure(key)
+        return None
+
+
+def _probe_backend(backend):
+    """Health check a backend.
+
+    For llama-server (api="openai"): uses /slots passive check (no inference).
+    For Ollama: uses passive observation only — real latency data comes from
+    actual user requests via _record_success. A lightweight /api/ps check
+    confirms the model is reachable.
+    """
+    key = _backend_key(backend["host"], backend["name"])
+
+    if backend["api"] == "openai":
+        return _passive_health_check_openai(backend)
+
+    # Ollama: lightweight reachability check via /api/ps (no inference)
+    try:
+        t0 = time.time()
+        url = backend["base_url"].rstrip("/") + "/api/ps"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            json.loads(resp.read())
+        latency_ms = (time.time() - t0) * 1000
+        # Only update latency if no actual request latency is already tracked.
+        # Passive /api/ps latency is network-only, not inference latency.
+        state = _get_backend_state(key)
+        if state.get("last_success", 0) == 0 or (time.time() - state.get("last_success", 0)) > 600:
+            # No recent real traffic — record passive latency as baseline
+            _record_success(key, latency_ms)
+        else:
+            # Just refresh last_probe timestamp without touching latency
+            with _backend_lock:
+                s = _backend_state.get(key, {})
+                s["last_probe"] = time.time()
+                _backend_state[key] = s
+        return latency_ms
+    except Exception:
         _record_failure(key)
         return None
 
@@ -867,6 +906,435 @@ def proxy_to_backend(backend, messages, params, timeout):
         )
 
 
+# ── Dashboard HTML ───────────────────────────────────────────────────
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>caproute dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e0e0e0; --dim: #888; --accent: #6c8cff;
+    --ok: #4ade80; --slow: #fbbf24; --down: #f87171; --idle: #64748b; --unknown: #94a3b8;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 13px; padding: 20px; }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+  .header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+  .header-left { display: flex; align-items: baseline; gap: 16px; }
+  .meta { color: var(--dim); font-size: 11px; }
+  .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; min-width: 120px; }
+  .stat-value { font-size: 22px; font-weight: 700; }
+  .stat-label { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  .section-title { font-size: 13px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 10px; }
+  .hosts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+  .host-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .host-name { font-size: 15px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .host-indicator { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .model-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; border-top: 1px solid var(--border); font-size: 12px; }
+  .model-row:first-child { border-top: none; }
+  .model-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-meta { display: flex; gap: 10px; align-items: center; color: var(--dim); flex-shrink: 0; margin-left: 8px; }
+  .badge { padding: 1px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+  .badge-ok { background: rgba(74,222,128,0.15); color: var(--ok); }
+  .badge-slow { background: rgba(251,191,36,0.15); color: var(--slow); }
+  .badge-down { background: rgba(248,113,113,0.15); color: var(--down); }
+  .badge-idle { background: rgba(100,116,139,0.15); color: var(--idle); }
+  .badge-unknown { background: rgba(148,163,184,0.15); color: var(--unknown); }
+  .cap-table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .cap-table th { text-align: left; color: var(--dim); font-weight: 500; font-size: 11px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .cap-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .cap-name { color: var(--accent); font-weight: 600; }
+  .score { font-variant-numeric: tabular-nums; }
+  .latency { font-variant-numeric: tabular-nums; }
+  .in-flight { color: var(--slow); font-weight: 600; }
+  .in-flight-zero { color: var(--dim); }
+  .untagged-list { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .pulse { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .error-banner { background: rgba(248,113,113,0.1); border: 1px solid var(--down); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; color: var(--down); display: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <h1>caproute</h1>
+    <span class="meta" id="mode">probe-routing</span>
+  </div>
+  <span class="meta" id="updated"></span>
+</div>
+
+<div class="error-banner" id="error-banner"></div>
+
+<div class="stats" id="stats"></div>
+
+<div class="section-title">Hosts</div>
+<div class="hosts-grid" id="hosts-grid"></div>
+
+<div class="section-title">Capabilities</div>
+<table class="cap-table" id="cap-table">
+  <thead><tr><th>Capability</th><th>Best Backend</th><th>Status</th><th>Score</th><th>Avg Latency</th><th>In-Flight</th></tr></thead>
+  <tbody id="cap-body"></tbody>
+</table>
+
+<div id="untagged-section" style="display:none">
+  <div class="section-title">Untagged Models</div>
+  <div class="untagged-list" id="untagged-list"></div>
+</div>
+
+<div class="section-title">Usage Over Time</div>
+<div style="background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px;">
+  <div style="display:flex; gap:10px; margin-bottom:10px; align-items:center;">
+    <select id="chart-window" style="background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:inherit; font-size:12px;">
+      <option value="5">Last 5 min</option>
+      <option value="15">Last 15 min</option>
+      <option value="60" selected>Last 1 hour</option>
+      <option value="360">Last 6 hours</option>
+      <option value="1440">Last 24 hours</option>
+    </select>
+    <span class="meta" id="chart-info"></span>
+  </div>
+  <canvas id="usage-chart" width="1200" height="300" style="width:100%; height:300px;"></canvas>
+  <div id="chart-legend" style="display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:10px; font-size:11px;"></div>
+</div>
+
+<script>
+const POLL_MS = 5000;
+let lastData = {};
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.floor(Date.now()/1000 - ts);
+  if (s < 5) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+
+function statusBadge(status) {
+  const cls = {ok:'badge-ok', slow:'badge-slow', down:'badge-down', idle:'badge-idle', unknown:'badge-unknown'}[status] || 'badge-unknown';
+  return `<span class="badge ${cls}">${status}</span>`;
+}
+
+function hostStatus(models) {
+  // host is ok if any model is ok, slow if any slow, down if all down
+  const statuses = models.map(m => m.status);
+  if (statuses.includes('ok')) return 'ok';
+  if (statuses.includes('slow')) return 'slow';
+  if (statuses.includes('idle') && !statuses.includes('down')) return 'idle';
+  if (statuses.every(s => s === 'down')) return 'down';
+  return 'unknown';
+}
+
+function statusColor(s) {
+  return {ok:'var(--ok)', slow:'var(--slow)', down:'var(--down)', idle:'var(--idle)'}[s] || 'var(--unknown)';
+}
+
+async function fetchAll() {
+  try {
+    const [backends, health, discovery] = await Promise.all([
+      fetch('/backends').then(r => r.json()),
+      fetch('/health').then(r => r.json()),
+      fetch('/discovery').then(r => r.json()),
+    ]);
+    document.getElementById('error-banner').style.display = 'none';
+    lastData = { backends: backends.backends || {}, health, discovery };
+    render();
+  } catch (e) {
+    const banner = document.getElementById('error-banner');
+    banner.textContent = 'Failed to fetch data: ' + e.message;
+    banner.style.display = 'block';
+  }
+}
+
+function render() {
+  const { backends, health, discovery } = lastData;
+  if (!backends || !health) return;
+
+  // Updated timestamp
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+
+  // Stats
+  const keys = Object.keys(backends);
+  const okCount = keys.filter(k => backends[k].status === 'ok').length;
+  const slowCount = keys.filter(k => backends[k].status === 'slow').length;
+  const downCount = keys.filter(k => backends[k].status === 'down').length;
+  const totalInFlight = keys.reduce((s, k) => s + (backends[k].in_flight || 0), 0);
+
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><div class="stat-value" style="color:var(--ok)">${okCount}</div><div class="stat-label">OK</div></div>
+    <div class="stat"><div class="stat-value" style="color:var(--slow)">${slowCount}</div><div class="stat-label">Slow</div></div>
+    <div class="stat"><div class="stat-value" style="color:var(--down)">${downCount}</div><div class="stat-label">Down</div></div>
+    <div class="stat"><div class="stat-value">${totalInFlight}</div><div class="stat-label">In-Flight</div></div>
+    <div class="stat"><div class="stat-value">${health.discovered_models || 0}</div><div class="stat-label">Models</div></div>
+    <div class="stat"><div class="stat-value">${(health.hosts || []).length}</div><div class="stat-label">Hosts</div></div>
+  `;
+
+  // Group backends by host
+  const byHost = {};
+  for (const [key, state] of Object.entries(backends)) {
+    const colonIdx = key.indexOf(':');
+    const host = key.substring(0, colonIdx);
+    const model = key.substring(colonIdx + 1);
+    if (!byHost[host]) byHost[host] = [];
+    byHost[host].push({ model, ...state });
+  }
+
+  // Sort hosts alphabetically, models by score
+  const hostNames = Object.keys(byHost).sort();
+  let hostsHtml = '';
+  for (const host of hostNames) {
+    const models = byHost[host].sort((a, b) => a.score - b.score);
+    const hs = hostStatus(models);
+    let modelsHtml = '';
+    for (const m of models) {
+      const latStr = m.avg_latency_ms ? m.avg_latency_ms + 'ms' : '-';
+      const ifCls = m.in_flight > 0 ? 'in-flight' : 'in-flight-zero';
+      const lastSeen = ago(m.last_success);
+      modelsHtml += `<div class="model-row">
+        <span class="model-name">${m.model}</span>
+        <span class="model-meta">
+          ${statusBadge(m.status)}
+          <span class="latency">${latStr}</span>
+          <span class="${ifCls}">${m.in_flight > 0 ? m.in_flight + ' req' : ''}</span>
+          <span class="score">${m.score}</span>
+        </span>
+      </div>`;
+    }
+    hostsHtml += `<div class="host-card">
+      <div class="host-name"><span class="host-indicator" style="background:${statusColor(hs)}"></span>${host}</div>
+      ${modelsHtml}
+    </div>`;
+  }
+  document.getElementById('hosts-grid').innerHTML = hostsHtml;
+
+  // Capabilities table
+  const capModels = health.capability_models || {};
+  let capHtml = '';
+  for (const cap of Object.keys(capModels).sort()) {
+    const models = capModels[cap] || [];
+    // Find best backend for this capability
+    let best = null;
+    let bestScore = Infinity;
+    for (const model of models) {
+      for (const [key, state] of Object.entries(backends)) {
+        const colonIdx = key.indexOf(':');
+        const bModel = key.substring(colonIdx + 1);
+        if (bModel === model && state.score < bestScore) {
+          bestScore = state.score;
+          best = { key, ...state, model };
+        }
+      }
+    }
+    if (best) {
+      const ifCls = best.in_flight > 0 ? 'in-flight' : 'in-flight-zero';
+      capHtml += `<tr>
+        <td class="cap-name">${cap}</td>
+        <td>${best.key}</td>
+        <td>${statusBadge(best.status)}</td>
+        <td class="score">${best.score}</td>
+        <td class="latency">${best.avg_latency_ms}ms</td>
+        <td class="${ifCls}">${best.in_flight || 0}</td>
+      </tr>`;
+    } else {
+      capHtml += `<tr>
+        <td class="cap-name">${cap}</td>
+        <td colspan="5" style="color:var(--dim)">no backends discovered</td>
+      </tr>`;
+    }
+  }
+  document.getElementById('cap-body').innerHTML = capHtml;
+
+  // Untagged models
+  const untagged = health.untagged_models || [];
+  const us = document.getElementById('untagged-section');
+  if (untagged.length > 0) {
+    us.style.display = 'block';
+    document.getElementById('untagged-list').textContent = untagged.join(', ');
+  } else {
+    us.style.display = 'none';
+  }
+}
+
+// ── Usage chart ──────────────────────────────────────────────────
+const MODEL_COLORS = [
+  '#6c8cff','#4ade80','#fbbf24','#f87171','#a78bfa','#fb923c',
+  '#38bdf8','#e879f9','#34d399','#f472b6','#facc15','#22d3ee',
+  '#818cf8','#fb7185','#a3e635','#c084fc',
+];
+let historyData = [];
+let colorMap = {};
+let colorIdx = 0;
+
+function getColor(model) {
+  if (!colorMap[model]) {
+    colorMap[model] = MODEL_COLORS[colorIdx % MODEL_COLORS.length];
+    colorIdx++;
+  }
+  return colorMap[model];
+}
+
+async function fetchHistory() {
+  try {
+    const windowMin = parseInt(document.getElementById('chart-window').value);
+    const since = Date.now()/1000 - windowMin * 60;
+    const resp = await fetch('/history?since=' + since);
+    const data = await resp.json();
+    historyData = data.history || [];
+    renderChart();
+  } catch(e) {}
+}
+
+function renderChart() {
+  const canvas = document.getElementById('usage-chart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const W = rect.width, H = rect.height;
+  const pad = { top: 10, right: 20, bottom: 30, left: 45 };
+  const plotW = W - pad.left - pad.right;
+  const plotH = H - pad.top - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const windowMin = parseInt(document.getElementById('chart-window').value);
+  const now = Date.now() / 1000;
+  const tMin = now - windowMin * 60;
+  const tMax = now;
+
+  // Bucket requests into time bins — adaptive bucket size
+  const numBuckets = Math.min(60, windowMin);
+  const bucketSec = (windowMin * 60) / numBuckets;
+
+  // Group by model
+  const models = {};
+  for (const r of historyData) {
+    if (r.ts < tMin) continue;
+    const key = r.model;
+    if (!models[key]) models[key] = new Array(numBuckets).fill(0);
+    const bi = Math.min(numBuckets - 1, Math.floor((r.ts - tMin) / bucketSec));
+    models[key][bi]++;
+  }
+
+  const modelNames = Object.keys(models).sort();
+  if (modelNames.length === 0) {
+    ctx.fillStyle = 'var(--dim)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#888';
+    ctx.fillText('No request history yet', W/2, H/2);
+    document.getElementById('chart-info').textContent = '0 requests';
+    document.getElementById('chart-legend').innerHTML = '';
+    return;
+  }
+
+  // Find max value for y-axis
+  let yMax = 1;
+  for (const name of modelNames) {
+    for (const v of models[name]) {
+      if (v > yMax) yMax = v;
+    }
+  }
+  yMax = Math.ceil(yMax * 1.15);
+
+  // Grid lines
+  ctx.strokeStyle = '#2a2d3a';
+  ctx.lineWidth = 0.5;
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; i++) {
+    const y = pad.top + plotH - (i / yTicks) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + plotW, y);
+    ctx.stroke();
+    ctx.fillStyle = '#888';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(yMax * i / yTicks), pad.left - 6, y + 3);
+  }
+
+  // Time labels
+  ctx.textAlign = 'center';
+  const xTicks = Math.min(6, numBuckets);
+  for (let i = 0; i <= xTicks; i++) {
+    const t = tMin + (i / xTicks) * (tMax - tMin);
+    const x = pad.left + (i / xTicks) * plotW;
+    const d = new Date(t * 1000);
+    const label = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+    ctx.fillStyle = '#888';
+    ctx.fillText(label, x, pad.top + plotH + 18);
+  }
+
+  // Y-axis label
+  ctx.save();
+  ctx.translate(12, pad.top + plotH/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.fillStyle = '#888';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('req / bucket', 0, 0);
+  ctx.restore();
+
+  // Plot lines
+  for (const name of modelNames) {
+    const color = getColor(name);
+    const buckets = models[name];
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let i = 0; i < numBuckets; i++) {
+      const x = pad.left + (i + 0.5) / numBuckets * plotW;
+      const y = pad.top + plotH - (buckets[i] / yMax) * plotH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Dots at non-zero points
+    for (let i = 0; i < numBuckets; i++) {
+      if (buckets[i] > 0) {
+        const x = pad.left + (i + 0.5) / numBuckets * plotW;
+        const y = pad.top + plotH - (buckets[i] / yMax) * plotH;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  // Legend
+  let legendHtml = '';
+  for (const name of modelNames) {
+    const color = getColor(name);
+    const total = models[name].reduce((a,b) => a+b, 0);
+    legendHtml += '<span style="display:inline-flex;align-items:center;gap:4px;">' +
+      '<span style="width:10px;height:10px;border-radius:2px;background:'+color+';display:inline-block;"></span>' +
+      name + ' <span style="color:#888">('+total+')</span></span>';
+  }
+  document.getElementById('chart-legend').innerHTML = legendHtml;
+  document.getElementById('chart-info').textContent = historyData.length + ' requests in window';
+}
+
+document.getElementById('chart-window').addEventListener('change', fetchHistory);
+
+fetchAll();
+fetchHistory();
+setInterval(fetchAll, POLL_MS);
+setInterval(fetchHistory, POLL_MS);
+</script>
+</body>
+</html>
+"""
+
 # ── HTTP handler ─────────────────────────────────────────────────────
 
 
@@ -970,7 +1438,12 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self._handle_discovery()
         elif self.path == "/backends":
             self._handle_backends()
+        elif self.path.startswith("/history"):
+            self._handle_history()
+        elif self.path == "/dashboard":
+            self._handle_dashboard()
         elif self.path == "/":
+
             self._send_json({"status": "caproute running", "mode": "probe-routing"})
         else:
             self._send_json({"error": "not found"}, 404)
@@ -1068,6 +1541,36 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             }
         self._send_json({"backends": result})
 
+    def _handle_history(self):
+        """Return request history, optionally filtered by ?since=<epoch>."""
+        since = 0
+        if "?" in self.path:
+            for part in self.path.split("?", 1)[1].split("&"):
+                if part.startswith("since="):
+                    try:
+                        since = float(part.split("=", 1)[1])
+                    except ValueError:
+                        pass
+        with _history_lock:
+            if since:
+                records = [r for r in _request_history if r["ts"] > since]
+            else:
+                records = list(_request_history)
+        self._send_json({"history": records, "count": len(records)})
+
+    def _handle_dashboard(self):
+        html = DASHBOARD_HTML
+        body = html.encode()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _handle_chat(self):
         body = self._read_body()
         try:
@@ -1145,6 +1648,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     result = proxy_to_backend(backend, messages, params, timeout)
                     latency_ms = (time.time() - t0) * 1000
                     _record_success(key, latency_ms)
+                    _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
                     result["_caproute"] = {
                         "capability": actual_cap,
                         "requested": model_field,
@@ -1159,7 +1663,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         self._send_json(result)
                     return
                 except Exception as e:
+                    latency_ms = (time.time() - t0) * 1000
                     _record_failure(key)
+                    _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
                     err = f"{backend['name']}@{backend['host']}: {e}"
                     print(f"[caproute] FAIL {err}")
                     errors.append(err)
