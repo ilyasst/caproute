@@ -972,6 +972,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="stats" id="stats"></div>
 
+<div class="section-title">Host Load Heatmap</div>
+<div style="background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px;">
+  <div style="display:flex; gap:10px; margin-bottom:10px; align-items:center;">
+    <select id="heatmap-window" style="background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:inherit; font-size:12px;">
+      <option value="15">Last 15 min</option>
+      <option value="60" selected>Last 1 hour</option>
+      <option value="360">Last 6 hours</option>
+      <option value="1440">Last 24 hours</option>
+    </select>
+    <span class="meta" id="heatmap-info"></span>
+    <span class="meta" style="margin-left:auto;">
+      <span style="display:inline-flex;align-items:center;gap:3px;">light = few <span style="display:inline-block;width:60px;height:10px;border-radius:2px;background:linear-gradient(to right,#1a1d27,#6c8cff,#4ade80,#fbbf24,#f87171);"></span> heavy</span>
+    </span>
+  </div>
+  <canvas id="heatmap-canvas" width="1200" height="200" style="width:100%; border-radius:4px;"></canvas>
+</div>
+
 <div class="section-title">Hosts</div>
 <div class="hosts-grid" id="hosts-grid"></div>
 
@@ -1160,6 +1177,153 @@ function render() {
   }
 }
 
+// ── Host load heatmap ────────────────────────────────────────────
+
+function heatColor(value, max) {
+  if (max === 0 || value === 0) return 'rgba(42,45,58,0.6)';
+  const t = Math.min(value / max, 1);
+  // 4-stop gradient: surface -> blue -> green -> yellow -> red
+  const stops = [
+    [26, 29, 42],    // var(--surface)
+    [108, 140, 255], // blue
+    [74, 222, 128],  // green
+    [251, 191, 36],  // yellow
+    [248, 113, 113], // red
+  ];
+  const pos = t * (stops.length - 1);
+  const i = Math.floor(pos);
+  const f = pos - i;
+  const a = stops[Math.min(i, stops.length - 1)];
+  const b = stops[Math.min(i + 1, stops.length - 1)];
+  const r = Math.round(a[0] + (b[0] - a[0]) * f);
+  const g = Math.round(a[1] + (b[1] - a[1]) * f);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * f);
+  return `rgb(${r},${g},${bl})`;
+}
+
+function renderHeatmap() {
+  const canvas = document.getElementById('heatmap-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+
+  const windowMin = parseInt(document.getElementById('heatmap-window').value);
+  const now = Date.now() / 1000;
+  const tMin = now - windowMin * 60;
+
+  // Bucket into time columns
+  const numCols = Math.min(48, windowMin);
+  const bucketSec = (windowMin * 60) / numCols;
+
+  // Group by host
+  const hostBuckets = {};
+  let totalReqs = 0;
+  for (const r of historyData) {
+    if (r.ts < tMin) continue;
+    totalReqs++;
+    const host = r.host;
+    if (!hostBuckets[host]) hostBuckets[host] = new Array(numCols).fill(0);
+    const bi = Math.min(numCols - 1, Math.floor((r.ts - tMin) / bucketSec));
+    hostBuckets[host][bi]++;
+  }
+
+  const hosts = Object.keys(hostBuckets).sort();
+
+  // Also include hosts from lastData that have no history yet
+  if (lastData.health) {
+    for (const h of (lastData.health.hosts || [])) {
+      if (!hosts.includes(h)) hosts.push(h);
+      if (!hostBuckets[h]) hostBuckets[h] = new Array(numCols).fill(0);
+    }
+    hosts.sort();
+  }
+
+  if (hosts.length === 0) {
+    canvas.height = 60 * dpr;
+    canvas.style.height = '60px';
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = '#888';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data yet', rect.width / 2, 30);
+    document.getElementById('heatmap-info').textContent = '';
+    return;
+  }
+
+  // Find global max for color scaling
+  let globalMax = 1;
+  for (const h of hosts) {
+    for (const v of hostBuckets[h]) {
+      if (v > globalMax) globalMax = v;
+    }
+  }
+
+  const labelW = 110;
+  const cellGap = 1;
+  const rowH = 28;
+  const headerH = 20;
+  const totalH = headerH + hosts.length * (rowH + cellGap);
+  canvas.width = rect.width * dpr;
+  canvas.height = totalH * dpr;
+  canvas.style.height = totalH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const plotW = rect.width - labelW;
+  const cellW = (plotW - (numCols - 1) * cellGap) / numCols;
+
+  // Time axis labels
+  ctx.fillStyle = '#888';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  const xTicks = Math.min(6, numCols);
+  for (let i = 0; i <= xTicks; i++) {
+    const t = tMin + (i / xTicks) * (windowMin * 60);
+    const x = labelW + (i / xTicks) * plotW;
+    const d = new Date(t * 1000);
+    ctx.fillText(d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0'), x, headerH - 4);
+  }
+
+  // Rows
+  for (let ri = 0; ri < hosts.length; ri++) {
+    const host = hosts[ri];
+    const y = headerH + ri * (rowH + cellGap);
+    const buckets = hostBuckets[host];
+    const hostTotal = buckets.reduce((a,b) => a+b, 0);
+
+    // Label
+    ctx.fillStyle = '#e0e0e0';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(host, labelW - 10, y + rowH / 2 + 4);
+
+    // Cells
+    for (let ci = 0; ci < numCols; ci++) {
+      const x = labelW + ci * (cellW + cellGap);
+      ctx.fillStyle = heatColor(buckets[ci], globalMax);
+      ctx.beginPath();
+      ctx.roundRect(x, y, cellW, rowH, 2);
+      ctx.fill();
+
+      // Show count in cell if value > 0 and cells are wide enough
+      if (buckets[ci] > 0 && cellW > 18) {
+        ctx.fillStyle = buckets[ci] / globalMax > 0.6 ? '#000' : '#ccc';
+        ctx.font = '9px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(buckets[ci], x + cellW / 2, y + rowH / 2 + 3);
+      }
+    }
+
+    // Total count at end
+    ctx.fillStyle = '#888';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+  }
+
+  document.getElementById('heatmap-info').textContent = totalReqs + ' requests across ' + hosts.length + ' hosts';
+}
+
+document.getElementById('heatmap-window').addEventListener('change', fetchHistory);
+
 // ── Usage chart ──────────────────────────────────────────────────
 const MODEL_COLORS = [
   '#6c8cff','#4ade80','#fbbf24','#f87171','#a78bfa','#fb923c',
@@ -1180,12 +1344,15 @@ function getColor(model) {
 
 async function fetchHistory() {
   try {
-    const windowMin = parseInt(document.getElementById('chart-window').value);
+    const chartMin = parseInt(document.getElementById('chart-window').value);
+    const heatMin = parseInt(document.getElementById('heatmap-window').value);
+    const windowMin = Math.max(chartMin, heatMin);
     const since = Date.now()/1000 - windowMin * 60;
     const resp = await fetch('/history?since=' + since);
     const data = await resp.json();
     historyData = data.history || [];
     renderChart();
+    renderHeatmap();
   } catch(e) {}
 }
 
