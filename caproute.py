@@ -74,11 +74,43 @@ _request_history = collections.deque(maxlen=2000)
 _history_lock = threading.Lock()
 
 
+import re
+
+_QUANT_RE = re.compile(r'[-_](Q\d+_K(?:_[A-Z]+)?|q\d+_\d+|f16|f32|bf16)$', re.IGNORECASE)
+_SIZE_RE = re.compile(r'^(.+?)[-:]([a-z]?\d+[bB](?:-[a-z0-9]+)?)$')
+
+
+def normalize_model_name(name):
+    """Normalize a model name for display grouping across backends.
+    e.g. 'Qwen3.5-27B-Q4_K_M.gguf' -> 'qwen3.5:27b'
+         'gemma4-e2b-it-q8_0' -> 'gemma4:e2b'
+    """
+    n = name.strip()
+    # Strip .gguf
+    if n.lower().endswith('.gguf'):
+        n = n[:-5]
+    # Lowercase
+    n = n.lower()
+    # Strip :latest
+    if n.endswith(':latest'):
+        n = n[:-7]
+    # Strip quantization suffixes (Q4_K_M, q8_0, etc.)
+    n = _QUANT_RE.sub('', n)
+    # Strip instruction-tuned marker
+    if n.endswith('-it'):
+        n = n[:-3]
+    # Normalize family-size pattern: "qwen3.5-27b" -> "qwen3.5:27b"
+    m = _SIZE_RE.match(n)
+    if m:
+        n = m.group(1) + ':' + m.group(2)
+    return n
+
+
 def _record_request(model, host, capability, latency_ms, success):
     """Append a request record to the history ring buffer."""
     entry = {
         "ts": time.time(),
-        "model": model,
+        "model": normalize_model_name(model),
         "host": host,
         "capability": capability,
         "latency_ms": round(latency_ms),
@@ -593,12 +625,31 @@ def _get_hosts(cfg):
 
 # Default fallback chain: each capability falls back to the one above it (higher quality).
 # Config can override with a "fallbacks" key.
+#
+# Values are (target_capability, overrides_dict) tuples. The overrides are merged
+# into the request params when the fallback hop is taken, allowing the source tier
+# to constrain the fallback target (e.g. cap reasoning effort when reasoning-fast
+# escalates to the heavyweight thinking tier).
+#
+# Backward compat: string values (old format) are treated as (target, {}).
 DEFAULT_FALLBACKS = {
-    "fast": "adequate",
-    "adequate": "powerful",
-    "powerful": "thinking",
-    "style": "adequate",
+    "fast": ("adequate", {}),
+    "adequate": ("powerful", {}),
+    "powerful": ("thinking", {}),
+    "style": ("adequate", {}),
+    "reasoning-fast": ("thinking", {"reasoning_effort": "low"}),
 }
+
+
+def _normalize_fallback(value):
+    """Accept either string (legacy) or (target, overrides) tuple. Returns tuple."""
+    if isinstance(value, str):
+        return (value, {})
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        target, overrides = value
+        return (target, dict(overrides) if overrides else {})
+    # Malformed — treat as string coercion
+    return (str(value), {})
 
 
 def get_capabilities():
@@ -612,9 +663,11 @@ def get_capabilities():
 
 
 def _get_fallbacks(cfg):
-    """Get fallback chain from config, merged with defaults."""
-    fallbacks = dict(DEFAULT_FALLBACKS)
-    fallbacks.update(cfg.get("fallbacks", {}))
+    """Get fallback chain from config, merged with defaults. All values normalized
+    to (target_capability, overrides_dict) tuples."""
+    fallbacks = {k: _normalize_fallback(v) for k, v in DEFAULT_FALLBACKS.items()}
+    for k, v in cfg.get("fallbacks", {}).items():
+        fallbacks[k] = _normalize_fallback(v)
     return fallbacks
 
 
@@ -691,34 +744,43 @@ def resolve_capability(capability):
     """
     Resolve a capability to backends sorted by probe score.
     If all backends are down, follows the fallback chain upward to higher-quality
-    categories until a healthy backend is found.
-    Returns (backends, actual_capability) tuple.
+    categories until a healthy backend is found. Each hop in the chain may contribute
+    override params (e.g. reasoning_effort) that are accumulated and applied when the
+    fallback target is reached.
+    Returns (backends, actual_capability, overrides) tuple.
     """
     backends = _resolve_capability_backends(capability)
     actual_cap = capability
+    overrides = {}
 
     if backends and not _has_healthy_backend(backends):
         # All backends for this capability are down — try fallback chain
         cfg = load_config()
         fallbacks = _get_fallbacks(cfg)
+        # Build ordered chain of (target_cap, overrides) pairs, accumulating overrides
         chain = []
         current = capability
+        acc_overrides = {}
         visited = set()
         while current in fallbacks and current not in visited:
             visited.add(current)
-            next_cap = fallbacks[current]
-            chain.append(next_cap)
+            next_cap, hop_overrides = fallbacks[current]
+            # Accumulate: earlier hops set defaults, later hops override
+            acc_overrides = {**acc_overrides, **hop_overrides}
+            chain.append((next_cap, dict(acc_overrides)))
             current = next_cap
 
-        for fallback_cap in chain:
+        for fallback_cap, fallback_overrides in chain:
             fb_backends = _resolve_capability_backends(fallback_cap)
             if fb_backends and _has_healthy_backend(fb_backends):
                 backends = fb_backends
                 actual_cap = fallback_cap
-                print(f"[caproute] fallback: {capability} -> {actual_cap}")
+                overrides = fallback_overrides
+                ov_str = f" overrides={overrides}" if overrides else ""
+                print(f"[caproute] fallback: {capability} -> {actual_cap}{ov_str}")
                 break
 
-    return backends, actual_cap
+    return backends, actual_cap, overrides
 
 
 def resolve_model_direct(model_name):
@@ -851,6 +913,7 @@ def _proxy_openai(base_url, model, messages, params, timeout):
         "top_p",
         "frequency_penalty",
         "presence_penalty",
+        "reasoning_effort",
     ]:
         if params.get(key) is not None:
             data[key] = params[key]
@@ -1497,6 +1560,48 @@ fetchHistory();
 setInterval(fetchAll, POLL_MS);
 setInterval(fetchHistory, POLL_MS);
 </script>
+
+<div style="margin-top:32px; border-top:1px solid var(--border); padding-top:16px; color:var(--dim); font-size:11px; line-height:1.7;">
+  <div class="section-title" style="margin-top:0;">Glossary</div>
+  <dl style="display:grid; grid-template-columns:120px 1fr; gap:4px 12px;">
+    <dt style="color:var(--text);">Request</dt>
+    <dd>A single chat completion call (<code>POST /v1/chat/completions</code>) routed through caproute to a backend. Each attempt to a backend counts as one request, including retries to different backends for the same client call.</dd>
+
+    <dt style="color:var(--text);">Capability</dt>
+    <dd>A logical label (e.g. <em>fast</em>, <em>powerful</em>, <em>thinking</em>) that maps to one or more models. Clients request a capability, and caproute picks the best available backend that serves a matching model.</dd>
+
+    <dt style="color:var(--text);">Score</dt>
+    <dd>A routing score computed per backend (lower is better). Combines average latency, consecutive failure count, in-flight request count, and status penalties (idle, down, unknown). Caproute always routes to the lowest-score backend first.</dd>
+
+    <dt style="color:var(--text);">Latency</dt>
+    <dd>Wall-clock time from when caproute sends the request to a backend until it receives the full response, in milliseconds. <em>Avg latency</em> is an exponential moving average &mdash; it recovers quickly when latency improves (alpha=0.5) and moves conservatively when it worsens (alpha=0.3).</dd>
+
+    <dt style="color:var(--text);">In-Flight</dt>
+    <dd>Number of requests currently being processed by a backend. Backends with higher in-flight counts get a score penalty so new requests are routed to less loaded machines.</dd>
+
+    <dt style="color:var(--text);">Bucket</dt>
+    <dd>A time interval used to aggregate requests in the charts. The time window is divided into equal-sized buckets (e.g. a 1-hour window uses ~60 one-minute buckets). Each bucket shows how many requests landed in that interval.</dd>
+
+    <dt style="color:var(--text);">Status</dt>
+    <dd>
+      <span style="color:var(--ok);">ok</span> &mdash; avg latency &lt; 2s, no recent failures<br>
+      <span style="color:var(--slow);">slow</span> &mdash; avg latency 2&ndash;10s, or 1&ndash;2 consecutive failures<br>
+      <span style="color:var(--down);">down</span> &mdash; 3+ consecutive failures; retried every 30s<br>
+      <span style="color:var(--idle);">idle</span> &mdash; model available on host but not loaded in memory (cold start needed)<br>
+      <span style="color:var(--unknown);">unknown</span> &mdash; never probed or never succeeded
+    </dd>
+
+    <dt style="color:var(--text);">Heatmap</dt>
+    <dd>Rows are hosts, columns are time buckets. Cell color intensity shows request volume relative to the busiest cell in the window &mdash; from dark (zero) through blue/green/yellow to red (peak load).</dd>
+
+    <dt style="color:var(--text);">Fallback</dt>
+    <dd>When all backends for a capability are down, caproute follows a fallback chain (e.g. fast &rarr; adequate &rarr; powerful &rarr; thinking) to find a healthy backend in a higher-quality tier.</dd>
+
+    <dt style="color:var(--text);">Probe</dt>
+    <dd>A tiny background request (5 tokens max) sent periodically to each loaded model to measure latency and detect failures without waiting for real traffic. Only models currently loaded in memory are probed.</dd>
+  </dl>
+</div>
+
 </body>
 </html>
 """
@@ -1760,6 +1865,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             "top_p",
             "frequency_penalty",
             "presence_penalty",
+            "reasoning_effort",
         ]:
             if key in req:
                 params[key] = req[key]
@@ -1771,12 +1877,17 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         current_cap = model_field
         errors = []
         visited_caps = set()
+        accumulated_overrides = {}
 
         while True:
             visited_caps.add(current_cap)
-            
+
             # Resolve: capability name or direct model name
-            backends, actual_cap = resolve_capability(current_cap)
+            backends, actual_cap, hop_overrides = resolve_capability(current_cap)
+            # Accumulate any overrides the fallback chain applied inside resolve_capability.
+            # User-provided params always win over fallback defaults (merged below per call).
+            if hop_overrides:
+                accumulated_overrides = {**accumulated_overrides, **hop_overrides}
 
             # If the user explicitly requested "thinking" and no backends are healthy,
             # DO NOT fall back to direct model names or return error immediately.
@@ -1811,7 +1922,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     print(
                         f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f})"
                     )
-                    result = proxy_to_backend(backend, messages, params, timeout)
+                    # Merge: fallback-chain overrides first, then user params (user wins)
+                    call_params = {**accumulated_overrides, **params}
+                    result = proxy_to_backend(backend, messages, call_params, timeout)
                     latency_ms = (time.time() - t0) * 1000
                     _record_success(key, latency_ms)
                     _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
@@ -1841,9 +1954,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             # All backends failed for the current batch. Try to fall back.
             cfg = load_config()
             fallbacks = _get_fallbacks(cfg)
-            if actual_cap in fallbacks and fallbacks[actual_cap] not in visited_caps:
-                current_cap = fallbacks[actual_cap]
-                print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}...")
+            if actual_cap in fallbacks and fallbacks[actual_cap][0] not in visited_caps:
+                next_cap, hop_overrides = fallbacks[actual_cap]
+                if hop_overrides:
+                    accumulated_overrides = {**accumulated_overrides, **hop_overrides}
+                current_cap = next_cap
+                ov_str = f" overrides={accumulated_overrides}" if accumulated_overrides else ""
+                print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}{ov_str}...")
                 continue
             else:
                 break
