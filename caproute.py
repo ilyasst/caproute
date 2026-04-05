@@ -103,11 +103,12 @@ def _record_success(key, latency_ms):
                 "status": "unknown",
             },
         )
-        # Exponential moving average (alpha=0.3)
-        alpha = 0.3
-        s["avg_latency_ms"] = alpha * latency_ms + (1 - alpha) * s.get(
-            "avg_latency_ms", 500
-        )
+        # Exponential moving average — asymmetric alpha for faster recovery.
+        # When latency improves (current < old avg), use higher alpha so
+        # backends bounce back quickly after transient slowness.
+        old_avg = s.get("avg_latency_ms", 500)
+        alpha = 0.5 if latency_ms < old_avg else 0.3
+        s["avg_latency_ms"] = alpha * latency_ms + (1 - alpha) * old_avg
         s["latency_ms"] = latency_ms
         s["failures"] = 0
         s["last_success"] = time.time()
@@ -225,8 +226,13 @@ def backend_score(key):
     # Penalty for consecutive failures, capped at 6 failures (30k max)
     # so transient outages don't permanently exclude backends
     score += min(failures, 6) * 5000
-    # Penalty for in-flight requests (prefer less loaded backends)
-    score += in_flight * 3000
+    # Penalty for in-flight requests (prefer less loaded backends).
+    # Higher penalty when backend is already slow/down to redirect load
+    # to idle backends faster.
+    if status in ("slow", "down"):
+        score += in_flight * 8000
+    else:
+        score += in_flight * 3000
     # Penalty for idle (available but not loaded — will need cold-start)
     if status == "idle":
         score += 10000
