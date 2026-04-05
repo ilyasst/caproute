@@ -406,30 +406,29 @@ def _get_loaded_models_openai(base_url):
 
 
 def _passive_health_check_openai(backend):
-    """Check llama-server health via /slots (no inference). Returns latency_ms or None.
+    """Check llama-server health via /health (no inference). Returns latency_ms or None.
 
-    This is a cheap HTTP GET that returns slot state. Much lighter than sending
-    a real "hi" inference probe — uses zero model compute.
+    Tries /slots first (llama-server-specific), falls back to /health (universal).
+    Much lighter than sending a real "hi" inference probe — uses zero model compute.
     """
     key = _backend_key(backend["host"], backend["name"])
-    try:
-        t0 = time.time()
-        url = backend["base_url"].rstrip("/") + "/slots"
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body = resp.read()
-            # llama-server returns a JSON array of slot dicts
-            # Some proxies may transform this — tolerate both
-            try:
-                slots = json.loads(body)
-            except Exception:
-                slots = None
-        latency_ms = (time.time() - t0) * 1000
-        _record_success(key, latency_ms)
-        return latency_ms
-    except Exception:
-        _record_failure(key)
-        return None
+    base_url = backend["base_url"].rstrip("/")
+    # Try /slots first, then /health as fallback (some servers disable /slots)
+    for endpoint in ("/slots", "/health"):
+        try:
+            t0 = time.time()
+            req = urllib.request.Request(base_url + endpoint, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status >= 400:
+                    continue
+                resp.read()
+            latency_ms = (time.time() - t0) * 1000
+            _record_success(key, latency_ms)
+            return latency_ms
+        except Exception:
+            continue
+    _record_failure(key)
+    return None
 
 
 def _probe_backend(backend):
