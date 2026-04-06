@@ -45,6 +45,100 @@ PROBE_INTERVAL = int(os.environ.get("CAPROUTE_PROBE_INTERVAL", "120"))
 PROBE_TIMEOUT = int(os.environ.get("CAPROUTE_PROBE_TIMEOUT", "10"))
 IDLE_PROBE_INTERVAL = int(os.environ.get("CAPROUTE_IDLE_PROBE_INTERVAL", "60"))
 DOWN_RETRY_INTERVAL = int(os.environ.get("CAPROUTE_DOWN_RETRY_INTERVAL", "30"))
+SYNC_INTERVAL = int(os.environ.get("CAPROUTE_SYNC_INTERVAL", "60"))
+
+# ── Config sync state ───────────────────────────────────────────────
+_sync_state = {
+    "last_poll": 0,
+    "last_update_from": None,
+    "last_update_at": 0,
+    "peers": {},  # peer_url -> {"last_seen": ts, "mtime": ts, "error": str|None}
+}
+_sync_lock = threading.Lock()
+
+
+def _config_mtime():
+    """Get mtime of local config file as epoch float."""
+    try:
+        return CONFIG_PATH.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def _sync_poll_peers():
+    """Poll sync_peers for newer config. Newest mtime wins."""
+    try:
+        cfg = load_config()
+    except Exception:
+        return
+    peers = cfg.get("sync_peers", [])
+    if not peers:
+        return
+    local_mtime = _config_mtime()
+    best_mtime = local_mtime
+    best_config = None
+    best_peer = None
+    for peer_url in peers:
+        url = peer_url.rstrip("/") + "/config"
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+            peer_mtime = data.get("mtime", 0)
+            peer_cfg = data.get("config")
+            with _sync_lock:
+                _sync_state["peers"][peer_url] = {
+                    "last_seen": time.time(),
+                    "mtime": peer_mtime,
+                    "error": None,
+                }
+            if peer_mtime > best_mtime and peer_cfg:
+                best_mtime = peer_mtime
+                best_config = peer_cfg
+                best_peer = peer_url
+        except Exception as e:
+            with _sync_lock:
+                _sync_state["peers"][peer_url] = {
+                    "last_seen": _sync_state["peers"].get(peer_url, {}).get("last_seen", 0),
+                    "mtime": 0,
+                    "error": str(e)[:120],
+                }
+    if best_config and best_peer:
+        # Preserve local sync_peers (each machine controls its own peer list)
+        try:
+            local_cfg = load_config()
+            local_sync_peers = local_cfg.get("sync_peers", [])
+        except Exception:
+            local_sync_peers = []
+        if local_sync_peers:
+            best_config["sync_peers"] = local_sync_peers
+        elif "sync_peers" in best_config:
+            del best_config["sync_peers"]
+        # Atomic write: write to tmp then rename
+        tmp_path = CONFIG_PATH.with_suffix(".tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(best_config, f, indent=2)
+            f.write("\n")
+        os.replace(str(tmp_path), str(CONFIG_PATH))
+        # Restore mtime from source so other peers see the same timestamp
+        os.utime(CONFIG_PATH, (best_mtime, best_mtime))
+        with _sync_lock:
+            _sync_state["last_update_from"] = best_peer
+            _sync_state["last_update_at"] = time.time()
+        print(f"[config-sync] Updated from {best_peer} (mtime {best_mtime:.0f})")
+    with _sync_lock:
+        _sync_state["last_poll"] = time.time()
+
+
+def _sync_loop():
+    """Background thread: poll peers every SYNC_INTERVAL seconds."""
+    while True:
+        try:
+            _sync_poll_peers()
+        except Exception as e:
+            print(f"[config-sync] Error: {e}")
+        time.sleep(SYNC_INTERVAL)
+
 
 # ── Discovery cache ──────────────────────────────────────────────────
 # Maps model_name -> [{"host": name, "url": base_url, "api": type}, ...]
@@ -2000,6 +2094,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self._handle_stats()
         elif self.path == "/stats/routing":
             self._handle_routing_log()
+        elif self.path == "/config":
+            self._handle_config()
+        elif self.path == "/config/status":
+            self._handle_config_status()
         elif self.path == "/":
 
             self._send_json({"status": "caproute running", "mode": "probe-routing"})
@@ -2012,6 +2110,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/discovery/refresh":
             run_discovery()
             self._send_json({"status": "ok", "models": get_discovery()})
+        elif self.path == "/config/sync":
+            _sync_poll_peers()
+            with _sync_lock:
+                self._send_json({"status": "ok", "sync_state": dict(_sync_state)})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -2177,6 +2279,30 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         with _routing_log_lock:
             records = list(_routing_log)
         self._send_json({"routing_log": records, "count": len(records)})
+
+    def _handle_config(self):
+        """Serve local config with mtime for peer sync."""
+        try:
+            cfg = load_config()
+            # Strip sync_peers from response (private to each machine)
+            cfg_out = {k: v for k, v in cfg.items() if k != "sync_peers"}
+            self._send_json({"mtime": _config_mtime(), "config": cfg_out})
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+
+    def _handle_config_status(self):
+        """Show config sync status."""
+        with _sync_lock:
+            state = dict(_sync_state)
+            state["peers"] = dict(state["peers"])
+        try:
+            cfg = load_config()
+            state["sync_peers"] = cfg.get("sync_peers", [])
+        except Exception:
+            state["sync_peers"] = []
+        state["local_mtime"] = _config_mtime()
+        state["config_path"] = str(CONFIG_PATH)
+        self._send_json(state)
 
     def _handle_dashboard(self):
         html = DASHBOARD_HTML
@@ -2405,6 +2531,15 @@ def main():
     p = threading.Thread(target=_probe_loop, daemon=True)
     p.start()
     print(f"[caproute] Probe interval: {PROBE_INTERVAL}s, timeout: {PROBE_TIMEOUT}s")
+
+    # Background config sync thread
+    sync_peers = cfg.get("sync_peers", [])
+    if sync_peers:
+        s = threading.Thread(target=_sync_loop, daemon=True)
+        s.start()
+        print(f"[caproute] Config sync: {len(sync_peers)} peers, interval {SYNC_INTERVAL}s")
+    else:
+        print(f"[caproute] Config sync: disabled (no sync_peers in config)")
 
     class PooledHTTPServer(http.server.HTTPServer):
         """HTTPServer that dispatches requests to a bounded thread pool."""

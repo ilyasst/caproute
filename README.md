@@ -224,6 +224,47 @@ When clients don't specify `max_tokens`, caproute injects a default of **8192** 
 | `/stats/routing` | GET | Raw routing decision log (last 5000 entries) |
 | `/history` | GET | Request history (ring buffer or SQLite since=epoch) |
 | `/dashboard` | GET | Built-in web dashboard |
+| `/config` | GET | Local config with mtime (for peer sync) |
+| `/config/status` | GET | Config sync state (peers, last update) |
+| `/config/sync` | POST | Trigger immediate sync poll |
+
+## Config sync (peer-to-peer)
+
+caproute instances can sync `llm.json` across machines. When you edit the config on any machine, the change propagates to all peers within one sync interval. No central server — each machine polls its peers and takes the newest version (highest file mtime).
+
+### Setup
+
+Add `sync_peers` to your `llm.json` on each machine — a list of caproute URLs to sync with:
+
+```json
+{
+  "hosts": { ... },
+  "capabilities": { ... },
+  "sync_peers": [
+    "http://openkaz:8800",
+    "http://darna:8800"
+  ]
+}
+```
+
+Each machine controls its own peer list. The `sync_peers` key is **never synced** — it stays local. This lets you control exactly which machines participate, keeping fleet info private from shared Tailscale nodes.
+
+### How it works
+
+- Every 60s (configurable), each machine polls `GET /config` on its peers
+- If any peer has a newer mtime, the config is adopted (atomic write)
+- The source mtime is preserved so other peers see a consistent timestamp
+- `sync_peers` is stripped from responses and preserved locally on writes
+
+### Introspection
+
+```bash
+# Check sync status
+curl http://localhost:8800/config/status
+
+# Force immediate sync
+curl -X POST http://localhost:8800/config/sync
+```
 
 ## Environment variables
 
@@ -235,3 +276,4 @@ When clients don't specify `max_tokens`, caproute injects a default of **8192** 
 | `CAPROUTE_DISCOVERY_INTERVAL` | `60` | Seconds between host discovery scans |
 | `CAPROUTE_PROBE_INTERVAL` | `5` | Seconds between backend health probes |
 | `CAPROUTE_PROBE_TIMEOUT` | `8` | Timeout for individual probe requests (seconds) |
+| `CAPROUTE_SYNC_INTERVAL` | `60` | Seconds between config sync polls |
