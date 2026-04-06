@@ -1156,7 +1156,13 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
         result = json.loads(resp.read())
 
     content, tool_calls = _extract_content(result)
-    return _wrap_openai_response(model, content, tool_calls)
+    # Ollama returns eval_count/prompt_eval_count, convert to OpenAI usage format
+    usage = {
+        "prompt_tokens": result.get("prompt_eval_count", 0),
+        "completion_tokens": result.get("eval_count", 0),
+        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0),
+    }
+    return _wrap_openai_response(model, content, tool_calls, usage=usage)
 
 
 def _proxy_openai(base_url, model, messages, params, timeout):
@@ -1191,10 +1197,11 @@ def _proxy_openai(base_url, model, messages, params, timeout):
         result = json.loads(resp.read())
 
     content, tool_calls = _extract_content(result)
-    return _wrap_openai_response(model, content, tool_calls)
+    usage = result.get("usage", {})
+    return _wrap_openai_response(model, content, tool_calls, usage=usage)
 
 
-def _wrap_openai_response(model, content, tool_calls=None):
+def _wrap_openai_response(model, content, tool_calls=None, usage=None):
     message = {"role": "assistant"}
     if content:
         message["content"] = content
@@ -1216,7 +1223,7 @@ def _wrap_openai_response(model, content, tool_calls=None):
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
@@ -1505,6 +1512,19 @@ function render() {
 
 // ── Host load heatmap ────────────────────────────────────────────
 
+// Polyfill for roundRect (Chrome <99, Firefox <112, some WebViews)
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+    if (typeof r === 'number') r = [r,r,r,r];
+    this.moveTo(x+r[0], y);
+    this.lineTo(x+w-r[1], y); this.quadraticCurveTo(x+w, y, x+w, y+r[1]);
+    this.lineTo(x+w, y+h-r[2]); this.quadraticCurveTo(x+w, y+h, x+w-r[2], y+h);
+    this.lineTo(x+r[3], y+h); this.quadraticCurveTo(x, y+h, x, y+h-r[3]);
+    this.lineTo(x, y+r[0]); this.quadraticCurveTo(x, y, x+r[0], y);
+    this.closePath();
+  };
+}
+
 function heatColor(value, max) {
   if (max === 0 || value === 0) return 'rgba(42,45,58,0.6)';
   const t = Math.min(value / max, 1);
@@ -1679,7 +1699,7 @@ async function fetchHistory() {
     historyData = data.history || [];
     renderChart();
     renderHeatmap();
-  } catch(e) {}
+  } catch(e) { console.error('fetchHistory error:', e); }
 }
 
 function renderChart() {
