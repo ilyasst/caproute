@@ -166,8 +166,13 @@ def _affinity_bonus(session_id, backend_key):
 
 
 def _log_routing(session_id, capability, chosen_backend, score,
-                 base_score, affinity_bonus, candidates_count):
-    """Record a routing decision for offline analysis."""
+                 base_score, affinity_bonus, candidates_count,
+                 latency_ms=0, prompt_tokens=0, completion_tokens=0):
+    """Record a routing decision for offline analysis.
+
+    latency_ms, prompt_tokens, completion_tokens are filled post-response
+    to enable cache-warmth measurement (lower prompt_tokens on turn 2+ = cache hit).
+    """
     with _routing_log_lock:
         _routing_log.append({
             "ts": time.time(),
@@ -178,6 +183,9 @@ def _log_routing(session_id, capability, chosen_backend, score,
             "base_score": base_score,
             "affinity_bonus": affinity_bonus,
             "candidates_count": candidates_count,
+            "latency_ms": round(latency_ms),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
         })
 
 # ── Request history (ring buffer for dashboard charts) ───────────────
@@ -2264,10 +2272,15 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
                     # Record session affinity — this backend now owns this session's cache.
                     _record_session_usage(session_id, key)
+                    # Extract token usage from response for cache-warmth analysis
+                    _usage = result.get("usage", {})
                     _log_routing(
                         session_id, actual_cap, key,
                         backend["_score"], backend.get("_base_score", backend["_score"]),
                         aff_bonus, len(backends),
+                        latency_ms=latency_ms,
+                        prompt_tokens=_usage.get("prompt_tokens", 0),
+                        completion_tokens=_usage.get("completion_tokens", 0),
                     )
                     result["_caproute"] = {
                         "capability": actual_cap,
