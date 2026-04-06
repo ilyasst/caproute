@@ -31,6 +31,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -224,20 +225,25 @@ def _compute_session_id(req):
 
 
 def _record_session_usage(session_id, backend_key):
-    """Mark that this session just used this backend. Also LRU-trim."""
+    """Mark that this session just used this backend.
+
+    Replaces any previous backend affinity for this session so we stick
+    to the new GPU and benefit from its cache.  Also LRU-trim.
+    """
     now = time.time()
     with _affinity_lock:
         if session_id not in _session_affinity:
-            # LRU cap check
             if len(_session_affinity) >= _AFFINITY_MAX_SESSIONS:
-                # Drop the session with the oldest max-timestamp
                 oldest = min(
                     _session_affinity.items(),
                     key=lambda kv: max(kv[1].values()) if kv[1] else 0,
                 )[0]
                 del _session_affinity[oldest]
             _session_affinity[session_id] = {}
-        _session_affinity[session_id][backend_key] = now
+        # Clear all previous backend affinities — commit fully to the
+        # new backend so cache warmth stickiness follows the GPU we
+        # actually got a slot on, not the one we used to use.
+        _session_affinity[session_id] = {backend_key: now}
 
 
 def _affinity_bonus(session_id, backend_key):
@@ -1225,7 +1231,66 @@ def _extract_content(result):
     return "", tool_calls
 
 
-def _proxy_ollama(base_url, model, messages, params, timeout):
+def _has_free_slot(base_url, api_type, model_name=None, timeout=2):
+    """Check if a backend has a free inference slot.
+
+    For llama-server (openai API): GET /slots -> [{is_processing: bool}, ...]
+    For llama-proxy (ollama API): need to hit the per-model llama-server port,
+        but we can try /slots on the proxy too — returns 400 if no model specified.
+        Fall through to "assume available" for backends that don't expose /slots.
+
+    Returns True if at least one slot is free, or if we can't determine (assume yes).
+    """
+    try:
+        if api_type == "ollama":
+            # Ollama/llama-proxy doesn't expose /slots per-model easily.
+            # Assume available — the actual request will fail fast (500/400) if not.
+            return True
+        url = base_url.rstrip("/") + "/slots"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            slots = json.loads(resp.read())
+        if not isinstance(slots, list):
+            return True  # unknown format, assume available
+        free = sum(1 for s in slots if not s.get("is_processing", False))
+        return free > 0
+    except Exception:
+        return True  # can't check, assume available
+
+
+def _http_post(url, body_bytes, connect_timeout, read_timeout):
+    """POST with separate connect and read timeouts.
+
+    connect_timeout: max seconds to establish TCP connection and send request.
+                     This is the "get a slot" window — if the backend is down
+                     or unreachable, we fail fast.
+    read_timeout:    max seconds to wait for the response body once connected.
+                     This covers the actual LLM generation time.
+    """
+    import http.client
+    parsed = urllib.parse.urlparse(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(parsed.hostname, port, timeout=connect_timeout)
+    else:
+        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=connect_timeout)
+    try:
+        conn.connect()  # uses connect_timeout
+        conn.sock.settimeout(read_timeout)  # switch to full timeout for generation
+        conn.request("POST", parsed.path, body=body_bytes,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(
+                url, resp.status, http.client.responses.get(resp.status, ""),
+                resp.msg, None,
+            )
+        return json.loads(resp.read())
+    finally:
+        conn.close()
+
+
+def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=None):
     url = base_url.rstrip("/") + "/api/chat"
     data = {
         "model": model,
@@ -1240,14 +1305,8 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
     if params.get("tools") is not None:
         data["tools"] = params["tools"]
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read())
+    ct = connect_timeout or timeout
+    result = _http_post(url, json.dumps(data).encode(), ct, timeout)
 
     content, tool_calls = _extract_content(result)
     # Ollama returns eval_count/prompt_eval_count, convert to OpenAI usage format
@@ -1259,7 +1318,7 @@ def _proxy_ollama(base_url, model, messages, params, timeout):
     return _wrap_openai_response(model, content, tool_calls, usage=usage)
 
 
-def _proxy_openai(base_url, model, messages, params, timeout):
+def _proxy_openai(base_url, model, messages, params, timeout, connect_timeout=None):
     url = base_url.rstrip("/") + "/v1/chat/completions"
     data = {
         "model": model,
@@ -1281,14 +1340,8 @@ def _proxy_openai(base_url, model, messages, params, timeout):
         if params.get(key) is not None:
             data[key] = params[key]
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read())
+    ct = connect_timeout or timeout
+    result = _http_post(url, json.dumps(data).encode(), ct, timeout)
 
     content, tool_calls = _extract_content(result)
     usage = result.get("usage", {})
@@ -1321,14 +1374,16 @@ def _wrap_openai_response(model, content, tool_calls=None, usage=None):
     }
 
 
-def proxy_to_backend(backend, messages, params, timeout):
+def proxy_to_backend(backend, messages, params, timeout, connect_timeout=None):
     if backend["api"] == "ollama":
         return _proxy_ollama(
-            backend["base_url"], backend["name"], messages, params, timeout
+            backend["base_url"], backend["name"], messages, params, timeout,
+            connect_timeout=connect_timeout,
         )
     else:
         return _proxy_openai(
-            backend["base_url"], backend["name"], messages, params, timeout
+            backend["base_url"], backend["name"], messages, params, timeout,
+            connect_timeout=connect_timeout,
         )
 
 
@@ -2365,110 +2420,161 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         visited_caps = set()
         accumulated_overrides = {}
 
+        # ── Retry-loop routing ──────────────────────────────────────────
+        # Instead of burning the full timeout on each backend sequentially,
+        # use a short per-attempt timeout and loop back through all
+        # capabilities until the total budget is exhausted.  This latches
+        # onto whichever backend recovers first.
+        _PER_ATTEMPT_BASE = int(os.getenv("CAPROUTE_PER_ATTEMPT_TIMEOUT", "2"))
+        _total_deadline = time.time() + timeout
+        _round = 0
+
         while True:
-            visited_caps.add(current_cap)
+            _round += 1
+            remaining = _total_deadline - time.time()
+            if remaining <= 0:
+                break
 
-            # Resolve: capability name or direct model name
-            backends, actual_cap, hop_overrides = resolve_capability(current_cap, session_id=session_id)
-            # Accumulate any overrides the fallback chain applied inside resolve_capability.
-            # User-provided params always win over fallback defaults (merged below per call).
-            if hop_overrides:
-                accumulated_overrides = {**accumulated_overrides, **hop_overrides}
+            # Per-attempt timeout is the CONNECT timeout only (time to get a slot).
+            # Once connected, the full capability timeout governs generation time.
+            # No need to grow — dead backends fail fast, busy ones accept quickly.
+            _PER_ATTEMPT_TIMEOUT = _PER_ATTEMPT_BASE
 
-            # If the user explicitly requested "thinking" and no backends are healthy,
-            # DO NOT fall back to direct model names or return error immediately.
-            # Keep the actual backends (even if slow) so proxy_to_backend can wait for them.
-            if actual_cap == "thinking" and not _has_healthy_backend(backends) and current_cap == model_field:
-                backends = _resolve_capability_backends("thinking")
+            current_cap = model_field
+            visited_caps_this_round = set()
 
-            if not backends and current_cap == model_field:
-                backends, _ = resolve_model_direct(model_field)
-                
-            if not backends:
-                if current_cap == model_field:
-                    self._send_json(
-                        {
-                            "error": f"unknown capability or model: '{model_field}'",
-                            "available": get_capabilities(),
-                        },
-                        400,
-                    )
-                    return
+            while True:
+                visited_caps_this_round.add(current_cap)
+
+                # Resolve: capability name or direct model name
+                backends, actual_cap, hop_overrides = resolve_capability(current_cap, session_id=session_id)
+                if hop_overrides:
+                    accumulated_overrides = {**accumulated_overrides, **hop_overrides}
+
+                # If the user explicitly requested "thinking" and no backends are healthy,
+                # keep the actual backends so proxy_to_backend can wait for them.
+                if actual_cap == "thinking" and not _has_healthy_backend(backends) and current_cap == model_field:
+                    backends = _resolve_capability_backends("thinking")
+
+                if not backends and current_cap == model_field:
+                    backends, _ = resolve_model_direct(model_field)
+
+                if not backends:
+                    if current_cap == model_field:
+                        self._send_json(
+                            {
+                                "error": f"unknown capability or model: '{model_field}'",
+                                "available": get_capabilities(),
+                            },
+                            400,
+                        )
+                        return
+                    else:
+                        break
+
+                # Use the shorter of per-attempt timeout or remaining budget.
+                attempt_timeout = min(_PER_ATTEMPT_TIMEOUT, _total_deadline - time.time())
+                if attempt_timeout <= 0:
+                    break
+
+                # Separate backends into slot-available vs slot-busy.
+                # Try slot-available first (including affinity-preferred).
+                # If ALL are busy, skip to next round instead of queuing.
+                _slot_available = []
+                _slot_busy = []
+                for backend in backends:
+                    if _has_free_slot(backend["base_url"], backend["api"], backend["name"]):
+                        _slot_available.append(backend)
+                    else:
+                        _slot_busy.append(backend)
+                if _slot_busy:
+                    _busy_names = ", ".join(f"{b['name']}@{b['host']}" for b in _slot_busy)
+                    print(f"[caproute] slots full, deferring: {_busy_names}")
+                if not _slot_available:
+                    # All slots busy — don't queue, escalate or retry next round.
+                    # This avoids burning the full read timeout waiting in a queue.
+                    break
+
+                for backend in _slot_available:
+                    if time.time() >= _total_deadline:
+                        break
+                    key = _backend_key(backend["host"], backend["name"])
+                    _inc_in_flight(key)
+                    try:
+                        t0 = time.time()
+                        aff_bonus = backend.get("_affinity_bonus", 0)
+                        aff_tag = f" aff=-{aff_bonus:.0f}" if aff_bonus else ""
+                        round_tag = f" r={_round}" if _round > 1 else ""
+                        print(
+                            f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag}{round_tag} t={attempt_timeout:.0f}s sess={session_id})"
+                        )
+                        call_params = {**accumulated_overrides, **params}
+                        result = proxy_to_backend(backend, messages, call_params, timeout,
+                                                  connect_timeout=attempt_timeout)
+                        latency_ms = (time.time() - t0) * 1000
+                        _record_success(key, latency_ms)
+                        _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
+                        _record_session_usage(session_id, key)
+                        _usage = result.get("usage", {})
+                        _log_routing(
+                            session_id, actual_cap, key,
+                            backend["_score"], backend.get("_base_score", backend["_score"]),
+                            aff_bonus, len(backends),
+                            latency_ms=latency_ms,
+                            prompt_tokens=_usage.get("prompt_tokens", 0),
+                            completion_tokens=_usage.get("completion_tokens", 0),
+                        )
+                        result["_caproute"] = {
+                            "capability": actual_cap,
+                            "requested": model_field,
+                            "model": backend["name"],
+                            "host": backend["host"],
+                            "latency_ms": round(latency_ms),
+                            "score": round(backend["_score"]),
+                            "round": _round,
+                        }
+                        if req.get("stream", False):
+                            self._send_sse(result)
+                        else:
+                            self._send_json(result)
+                        return
+                    except Exception as e:
+                        latency_ms = (time.time() - t0) * 1000
+                        _record_failure(key)
+                        _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
+                        err = f"{backend['name']}@{backend['host']}: {e}"
+                        print(f"[caproute] FAIL {err}")
+                        errors.append(err)
+                    finally:
+                        _dec_in_flight(key)
+
+                # All backends failed for current capability. Escalate.
+                cfg = load_config()
+                fallbacks = _get_fallbacks(cfg)
+                if actual_cap in fallbacks and fallbacks[actual_cap][0] not in visited_caps_this_round:
+                    next_cap, hop_overrides = fallbacks[actual_cap]
+                    if hop_overrides:
+                        accumulated_overrides = {**accumulated_overrides, **hop_overrides}
+                    current_cap = next_cap
+                    ov_str = f" overrides={accumulated_overrides}" if accumulated_overrides else ""
+                    print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}{ov_str}...")
+                    continue
                 else:
                     break
 
-            # Try each backend in score order (best first).
-            # Use the full timeout per backend since we already know which ones are alive
-            # from probing — no need to split timeout across backends.
-            for backend in backends:
-                key = _backend_key(backend["host"], backend["name"])
-                _inc_in_flight(key)
-                try:
-                    t0 = time.time()
-                    aff_bonus = backend.get("_affinity_bonus", 0)
-                    aff_tag = f" aff=-{aff_bonus:.0f}" if aff_bonus else ""
-                    print(
-                        f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag} sess={session_id})"
-                    )
-                    # Merge: fallback-chain overrides first, then user params (user wins)
-                    call_params = {**accumulated_overrides, **params}
-                    result = proxy_to_backend(backend, messages, call_params, timeout)
-                    latency_ms = (time.time() - t0) * 1000
-                    _record_success(key, latency_ms)
-                    _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
-                    # Record session affinity — this backend now owns this session's cache.
-                    _record_session_usage(session_id, key)
-                    # Extract token usage from response for cache-warmth analysis
-                    _usage = result.get("usage", {})
-                    _log_routing(
-                        session_id, actual_cap, key,
-                        backend["_score"], backend.get("_base_score", backend["_score"]),
-                        aff_bonus, len(backends),
-                        latency_ms=latency_ms,
-                        prompt_tokens=_usage.get("prompt_tokens", 0),
-                        completion_tokens=_usage.get("completion_tokens", 0),
-                    )
-                    result["_caproute"] = {
-                        "capability": actual_cap,
-                        "requested": model_field,
-                        "model": backend["name"],
-                        "host": backend["host"],
-                        "latency_ms": round(latency_ms),
-                        "score": round(backend["_score"]),
-                    }
-                    if req.get("stream", False):
-                        self._send_sse(result)
-                    else:
-                        self._send_json(result)
-                    return
-                except Exception as e:
-                    latency_ms = (time.time() - t0) * 1000
-                    _record_failure(key)
-                    _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
-                    err = f"{backend['name']}@{backend['host']}: {e}"
-                    print(f"[caproute] FAIL {err}")
-                    errors.append(err)
-                finally:
-                    _dec_in_flight(key)
-
-            # All backends failed for the current batch. Try to fall back.
-            cfg = load_config()
-            fallbacks = _get_fallbacks(cfg)
-            if actual_cap in fallbacks and fallbacks[actual_cap][0] not in visited_caps:
-                next_cap, hop_overrides = fallbacks[actual_cap]
-                if hop_overrides:
-                    accumulated_overrides = {**accumulated_overrides, **hop_overrides}
-                current_cap = next_cap
-                ov_str = f" overrides={accumulated_overrides}" if accumulated_overrides else ""
-                print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}{ov_str}...")
-                continue
-            else:
-                break
+            # End of one full sweep through capability chain.
+            # Loop back for another round with fresh scores.
+            if time.time() < _total_deadline:
+                wait = min(2.0, _total_deadline - time.time())
+                print(f"[caproute] round {_round} exhausted, retrying in {wait:.0f}s ({_total_deadline - time.time():.0f}s left)...")
+                time.sleep(wait)
 
         self._send_json(
             {
                 "error": f"all backends failed for '{model_field}'",
-                "tried": errors,
+                "tried": errors[-10:],  # last 10 errors to avoid huge payloads
+                "rounds": _round,
+                "elapsed": round(time.time() - (_total_deadline - timeout)),
             },
             503,
         )
