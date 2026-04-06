@@ -182,6 +182,49 @@ systemctl --user status caproute
 journalctl --user -u caproute -f
 ```
 
+## Session affinity (cache warmth)
+
+caproute tracks which backend recently served each conversation session. Subsequent requests from the same session prefer the same backend, keeping KV cache warm across turns — measured **4.4x speedup** on turn-2+ vs cold starts.
+
+Session identity is derived from the OpenAI `user` field or a hash of the system prompt + first user message. Affinity decays over time:
+
+| Window | Bonus | Effect |
+|--------|-------|--------|
+| < 5 min (strong) | -40000 score | Firmly pins to same backend |
+| 5-15 min (mild) | -25000 score | Moderate preference, allows rebalancing |
+| > 15 min | 0 | No preference, fully load-balanced |
+
+Backends that are `down` never receive affinity bonus, ensuring failover still works.
+
+### Introspection
+
+```bash
+# Session affinity map + routing stats
+curl http://localhost:8800/stats
+
+# Raw routing decision log (last 5000 decisions)
+curl http://localhost:8800/stats/routing
+```
+
+### Default max_tokens
+
+When clients don't specify `max_tokens`, caproute injects a default of **8192** tokens. This prevents llama-server's OpenAI-compat default of 4096, which truncates thinking models (reasoning can consume 4K+ tokens alone, leaving nothing for the actual answer).
+
+## Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completion — put capability in `model` field |
+| `/v1/models` | GET | List available capabilities |
+| `/health` | GET | Config status, untagged models |
+| `/discovery` | GET | Full model-to-host-to-capability map |
+| `/discovery/refresh` | POST | Force immediate re-discovery |
+| `/backends` | GET | Real-time backend state (probe-routing scores, latency, in-flight) |
+| `/stats` | GET | Session affinity state + aggregate routing counters |
+| `/stats/routing` | GET | Raw routing decision log (last 5000 entries) |
+| `/history` | GET | Request history (ring buffer or SQLite since=epoch) |
+| `/dashboard` | GET | Built-in web dashboard |
+
 ## Environment variables
 
 | Variable | Default | Description |

@@ -70,6 +70,116 @@ _backend_lock = threading.Lock()
 _in_flight_lock = threading.Lock()
 _in_flight = {}  # "host:model" -> int
 
+# ── Session affinity (cache-warmth stickiness) ───────────────────────
+# Tracks which backend recently served each "session", so subsequent
+# requests from the same conversation prefer the same backend and benefit
+# from warm KV cache. Session identity is derived from the request's `user`
+# field (OpenAI standard) or a hash of the system prompt + first user msg.
+#
+# IMPORTANT: the values below are initial heuristics, NOT tuned from data.
+# See ~/Syncs/brain-ousted/System/Caproute_Session_Affinity_Tuning.md for
+# tuning plan based on /stats data we log.
+import hashlib
+
+_session_affinity = {}           # session_id -> {backend_key: last_used_ts}
+_affinity_lock = threading.Lock()
+_AFFINITY_STRONG_WINDOW_S = 300  # 5 min: strong preference for same backend
+_AFFINITY_MILD_WINDOW_S = 900    # 15 min: mild preference
+_AFFINITY_STRONG_BONUS = 40000   # score reduction (lower score = better)
+_AFFINITY_MILD_BONUS = 25000   # tuned 2026-04-05: 15K was too weak vs p50 base scores of 28-57K
+_AFFINITY_MAX_SESSIONS = 500     # LRU cap to prevent unbounded growth
+
+# Routing decision log (for offline analysis of affinity effectiveness)
+_routing_log = collections.deque(maxlen=5000)
+_routing_log_lock = threading.Lock()
+
+
+def _compute_session_id(req):
+    """Derive a stable session identifier from the request.
+
+    Priority:
+    1. Client-supplied `user` field (OpenAI standard).
+    2. Hash of (system prompt + first user message) — stable across turns
+       of the same conversation because those don't change.
+
+    Returns a short hex string (16 chars) prefixed with source tag.
+    """
+    user = req.get("user")
+    if user:
+        return "u:" + hashlib.sha256(str(user).encode()).hexdigest()[:16]
+
+    msgs = req.get("messages") or []
+    sig_parts = []
+    # Collect system message(s) + first user message for the prefix hash
+    saw_user = False
+    for m in msgs:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", c)) for c in content if c)
+        if role == "system":
+            sig_parts.append(f"sys:{str(content)[:2000]}")
+        elif role == "user" and not saw_user:
+            sig_parts.append(f"usr:{str(content)[:1000]}")
+            saw_user = True
+            break
+    if not sig_parts:
+        return "empty"
+    sig = "|".join(sig_parts)
+    return "p:" + hashlib.sha256(sig.encode()).hexdigest()[:16]
+
+
+def _record_session_usage(session_id, backend_key):
+    """Mark that this session just used this backend. Also LRU-trim."""
+    now = time.time()
+    with _affinity_lock:
+        if session_id not in _session_affinity:
+            # LRU cap check
+            if len(_session_affinity) >= _AFFINITY_MAX_SESSIONS:
+                # Drop the session with the oldest max-timestamp
+                oldest = min(
+                    _session_affinity.items(),
+                    key=lambda kv: max(kv[1].values()) if kv[1] else 0,
+                )[0]
+                del _session_affinity[oldest]
+            _session_affinity[session_id] = {}
+        _session_affinity[session_id][backend_key] = now
+
+
+def _affinity_bonus(session_id, backend_key):
+    """Return score reduction (positive number) if session has recent affinity."""
+    if not session_id:
+        return 0
+    with _affinity_lock:
+        sess = _session_affinity.get(session_id)
+        if not sess:
+            return 0
+        ts = sess.get(backend_key)
+        if ts is None:
+            return 0
+        age = time.time() - ts
+    if age < _AFFINITY_STRONG_WINDOW_S:
+        return _AFFINITY_STRONG_BONUS
+    if age < _AFFINITY_MILD_WINDOW_S:
+        return _AFFINITY_MILD_BONUS
+    return 0
+
+
+def _log_routing(session_id, capability, chosen_backend, score,
+                 base_score, affinity_bonus, candidates_count):
+    """Record a routing decision for offline analysis."""
+    with _routing_log_lock:
+        _routing_log.append({
+            "ts": time.time(),
+            "session_id": session_id,
+            "capability": capability,
+            "backend": chosen_backend,
+            "final_score": score,
+            "base_score": base_score,
+            "affinity_bonus": affinity_bonus,
+            "candidates_count": candidates_count,
+        })
+
 # ── Request history (ring buffer for dashboard charts) ───────────────
 _request_history = collections.deque(maxlen=2000)
 _history_lock = threading.Lock()
@@ -375,11 +485,14 @@ def _dec_in_flight(key):
             _backend_state[key]["in_flight"] = _in_flight.get(key, 0)
 
 
-def backend_score(key):
+def backend_score(key, session_id=None):
     """
     Score for routing. Lower = better.
-    Combines: avg latency, consecutive failures, in-flight count.
-    Down backends get a high score but are still tried (not permanently dead).
+    Combines: avg latency, consecutive failures, in-flight count, and
+    (when session_id given) session affinity bonus that prefers recently-
+    used backends for cache warmth.
+
+    Backward compatible: session_id is optional.
     """
     with _backend_lock:
         s = _backend_state.get(
@@ -420,6 +533,12 @@ def backend_score(key):
     # Small penalty for unknown status (prefer backends we've seen succeed)
     elif status == "unknown":
         score += 1000
+
+    # Session affinity: reward backends that recently served this session.
+    # Subtracted (not added) because lower score = better. Only kicks in when
+    # the backend is at least minimally healthy (not permanently down).
+    if session_id and status != "down":
+        score -= _affinity_bonus(session_id, key)
 
     return score
 
@@ -816,8 +935,13 @@ def _get_all_tagged_models(cfg):
     return set(cfg.get("models", {}).keys())
 
 
-def _resolve_capability_backends(capability):
-    """Resolve a capability to backends sorted by probe score. Returns empty list if none available."""
+def _resolve_capability_backends(capability, session_id=None):
+    """Resolve a capability to backends sorted by probe score.
+
+    When session_id is provided, backends recently used by that session
+    receive a score bonus (cache warmth stickiness). Returns empty list
+    if no backends available.
+    """
     cfg = load_config()
     model_list = _get_capability_models(cfg, capability)
     if not model_list:
@@ -846,7 +970,8 @@ def _resolve_capability_backends(capability):
                 continue
 
             key = _backend_key(host_name, model_name)
-            score = backend_score(key)
+            base = backend_score(key, session_id=None)  # no affinity
+            score = backend_score(key, session_id=session_id)
             backends.append(
                 {
                     "name": model_name,
@@ -854,6 +979,9 @@ def _resolve_capability_backends(capability):
                     "api": h["api"],
                     "host": host_name,
                     "_score": score,
+                    "_base_score": base,
+                    "_affinity_bonus": max(0, base - score),
+                    "_key": key,
                 }
             )
 
@@ -866,7 +994,7 @@ def _has_healthy_backend(backends):
     return any(b["_score"] < 999999 for b in backends)
 
 
-def resolve_capability(capability):
+def resolve_capability(capability, session_id=None):
     """
     Resolve a capability to backends sorted by probe score.
     If all backends are down, follows the fallback chain upward to higher-quality
@@ -874,8 +1002,9 @@ def resolve_capability(capability):
     override params (e.g. reasoning_effort) that are accumulated and applied when the
     fallback target is reached.
     Returns (backends, actual_capability, overrides) tuple.
+    When session_id is given, prefers backends with recent affinity to that session.
     """
-    backends = _resolve_capability_backends(capability)
+    backends = _resolve_capability_backends(capability, session_id=session_id)
     actual_cap = capability
     overrides = {}
 
@@ -897,7 +1026,7 @@ def resolve_capability(capability):
             current = next_cap
 
         for fallback_cap, fallback_overrides in chain:
-            fb_backends = _resolve_capability_backends(fallback_cap)
+            fb_backends = _resolve_capability_backends(fallback_cap, session_id=session_id)
             if fb_backends and _has_healthy_backend(fb_backends):
                 backends = fb_backends
                 actual_cap = fallback_cap
@@ -1839,6 +1968,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self._handle_history()
         elif self.path == "/dashboard":
             self._handle_dashboard()
+        elif self.path == "/stats":
+            self._handle_stats()
+        elif self.path == "/stats/routing":
+            self._handle_routing_log()
         elif self.path == "/":
 
             self._send_json({"status": "caproute running", "mode": "probe-routing"})
@@ -1956,6 +2089,67 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 records = list(_request_history)
         self._send_json({"history": records, "count": len(records)})
 
+    def _handle_stats(self):
+        """Return session affinity state + aggregate routing stats."""
+        now = time.time()
+        with _affinity_lock:
+            sessions = {
+                sid: {
+                    "backends": [
+                        {
+                            "key": k,
+                            "last_used_age_s": round(now - ts, 1),
+                            "stickiness": (
+                                "strong" if now - ts < _AFFINITY_STRONG_WINDOW_S
+                                else "mild" if now - ts < _AFFINITY_MILD_WINDOW_S
+                                else "expired"
+                            ),
+                        }
+                        for k, ts in sorted(usage.items(), key=lambda kv: -kv[1])
+                    ],
+                }
+                for sid, usage in _session_affinity.items()
+            }
+
+        # Compute per-session routing hit/miss summaries from the log.
+        with _routing_log_lock:
+            routing_log = list(_routing_log)
+
+        per_session = {}
+        per_backend = {}
+        for entry in routing_log:
+            sid = entry["session_id"]
+            ps = per_session.setdefault(sid, {
+                "requests": 0, "with_affinity": 0, "total_bonus": 0,
+            })
+            ps["requests"] += 1
+            if entry["affinity_bonus"] > 0:
+                ps["with_affinity"] += 1
+                ps["total_bonus"] += entry["affinity_bonus"]
+            pb = per_backend.setdefault(entry["backend"], {"requests": 0})
+            pb["requests"] += 1
+
+        self._send_json({
+            "config": {
+                "strong_window_s": _AFFINITY_STRONG_WINDOW_S,
+                "mild_window_s": _AFFINITY_MILD_WINDOW_S,
+                "strong_bonus": _AFFINITY_STRONG_BONUS,
+                "mild_bonus": _AFFINITY_MILD_BONUS,
+                "max_sessions": _AFFINITY_MAX_SESSIONS,
+            },
+            "active_sessions": len(sessions),
+            "sessions": sessions,
+            "per_session_routing": per_session,
+            "per_backend_routing": per_backend,
+            "total_routing_decisions": len(routing_log),
+        })
+
+    def _handle_routing_log(self):
+        """Raw routing log (last N decisions)."""
+        with _routing_log_lock:
+            records = list(_routing_log)
+        self._send_json({"routing_log": records, "count": len(records)})
+
     def _handle_dashboard(self):
         html = DASHBOARD_HTML
         body = html.encode()
@@ -1997,6 +2191,17 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             if key in req:
                 params[key] = req[key]
 
+        # Inject a sensible max_tokens default when client omits it.
+        # llama-server's OpenAI adapter defaults to 4096, which causes thinking
+        # models to truncate (reasoning alone can hit 4K, leaving ~0 for answer).
+        # Based on 2026-04-05 overnight experiment: p95 of reasoning+answer ≈ 5700.
+        # 8192 gives safety margin while staying under Qwen3 16K training ceiling.
+        if "max_tokens" not in params:
+            params["max_tokens"] = 8192
+
+        # Compute session identifier for affinity tracking (cache warmth).
+        session_id = _compute_session_id(req)
+
         cfg = load_config()
         default_timeout = _get_timeout(cfg, model_field)
         timeout = req.get("timeout", default_timeout)
@@ -2010,7 +2215,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             visited_caps.add(current_cap)
 
             # Resolve: capability name or direct model name
-            backends, actual_cap, hop_overrides = resolve_capability(current_cap)
+            backends, actual_cap, hop_overrides = resolve_capability(current_cap, session_id=session_id)
             # Accumulate any overrides the fallback chain applied inside resolve_capability.
             # User-provided params always win over fallback defaults (merged below per call).
             if hop_overrides:
@@ -2046,8 +2251,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 _inc_in_flight(key)
                 try:
                     t0 = time.time()
+                    aff_bonus = backend.get("_affinity_bonus", 0)
+                    aff_tag = f" aff=-{aff_bonus:.0f}" if aff_bonus else ""
                     print(
-                        f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f})"
+                        f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag} sess={session_id})"
                     )
                     # Merge: fallback-chain overrides first, then user params (user wins)
                     call_params = {**accumulated_overrides, **params}
@@ -2055,6 +2262,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     latency_ms = (time.time() - t0) * 1000
                     _record_success(key, latency_ms)
                     _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
+                    # Record session affinity — this backend now owns this session's cache.
+                    _record_session_usage(session_id, key)
+                    _log_routing(
+                        session_id, actual_cap, key,
+                        backend["_score"], backend.get("_base_score", backend["_score"]),
+                        aff_bonus, len(backends),
+                    )
                     result["_caproute"] = {
                         "capability": actual_cap,
                         "requested": model_field,
