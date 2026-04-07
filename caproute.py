@@ -100,7 +100,9 @@ def _sync_poll_peers():
         except Exception as e:
             with _sync_lock:
                 _sync_state["peers"][peer_url] = {
-                    "last_seen": _sync_state["peers"].get(peer_url, {}).get("last_seen", 0),
+                    "last_seen": _sync_state["peers"]
+                    .get(peer_url, {})
+                    .get("last_seen", 0),
                     "mtime": 0,
                     "error": str(e)[:120],
                 }
@@ -176,13 +178,15 @@ _in_flight = {}  # "host:model" -> int
 # tuning plan based on /stats data we log.
 import hashlib
 
-_session_affinity = {}           # session_id -> {backend_key: last_used_ts}
+_session_affinity = {}  # session_id -> {backend_key: last_used_ts}
 _affinity_lock = threading.Lock()
 _AFFINITY_STRONG_WINDOW_S = 300  # 5 min: strong preference for same backend
-_AFFINITY_MILD_WINDOW_S = 900    # 15 min: mild preference
-_AFFINITY_STRONG_BONUS = 40000   # score reduction (lower score = better)
-_AFFINITY_MILD_BONUS = 25000   # tuned 2026-04-05: 15K was too weak vs p50 base scores of 28-57K
-_AFFINITY_MAX_SESSIONS = 500     # LRU cap to prevent unbounded growth
+_AFFINITY_MILD_WINDOW_S = 900  # 15 min: mild preference
+_AFFINITY_STRONG_BONUS = 40000  # score reduction (lower score = better)
+_AFFINITY_MILD_BONUS = (
+    25000  # tuned 2026-04-05: 15K was too weak vs p50 base scores of 28-57K
+)
+_AFFINITY_MAX_SESSIONS = 500  # LRU cap to prevent unbounded growth
 
 # Routing decision log (for offline analysis of affinity effectiveness)
 _routing_log = collections.deque(maxlen=5000)
@@ -265,28 +269,40 @@ def _affinity_bonus(session_id, backend_key):
     return 0
 
 
-def _log_routing(session_id, capability, chosen_backend, score,
-                 base_score, affinity_bonus, candidates_count,
-                 latency_ms=0, prompt_tokens=0, completion_tokens=0):
+def _log_routing(
+    session_id,
+    capability,
+    chosen_backend,
+    score,
+    base_score,
+    affinity_bonus,
+    candidates_count,
+    latency_ms=0,
+    prompt_tokens=0,
+    completion_tokens=0,
+):
     """Record a routing decision for offline analysis.
 
     latency_ms, prompt_tokens, completion_tokens are filled post-response
     to enable cache-warmth measurement (lower prompt_tokens on turn 2+ = cache hit).
     """
     with _routing_log_lock:
-        _routing_log.append({
-            "ts": time.time(),
-            "session_id": session_id,
-            "capability": capability,
-            "backend": chosen_backend,
-            "final_score": score,
-            "base_score": base_score,
-            "affinity_bonus": affinity_bonus,
-            "candidates_count": candidates_count,
-            "latency_ms": round(latency_ms),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-        })
+        _routing_log.append(
+            {
+                "ts": time.time(),
+                "session_id": session_id,
+                "capability": capability,
+                "backend": chosen_backend,
+                "final_score": score,
+                "base_score": base_score,
+                "affinity_bonus": affinity_bonus,
+                "candidates_count": candidates_count,
+                "latency_ms": round(latency_ms),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            }
+        )
+
 
 # ── Request history (ring buffer for dashboard charts) ───────────────
 _request_history = collections.deque(maxlen=2000)
@@ -295,8 +311,10 @@ _history_lock = threading.Lock()
 
 import re
 
-_QUANT_RE = re.compile(r'[-_](Q\d+_K(?:_[A-Z]+)?|q\d+_\d+|f16|f32|bf16)$', re.IGNORECASE)
-_SIZE_RE = re.compile(r'^(.+?)[-:]([a-z]?\d+[bB](?:-[a-z0-9]+)?)$')
+_QUANT_RE = re.compile(
+    r"[-_](Q\d+_K(?:_[A-Z]+)?|q\d+_\d+|f16|f32|bf16)$", re.IGNORECASE
+)
+_SIZE_RE = re.compile(r"^(.+?)[-:]([a-z]?\d+[bB](?:-[a-z0-9]+)?)$")
 
 
 def normalize_model_name(name):
@@ -306,22 +324,22 @@ def normalize_model_name(name):
     """
     n = name.strip()
     # Strip .gguf
-    if n.lower().endswith('.gguf'):
+    if n.lower().endswith(".gguf"):
         n = n[:-5]
     # Lowercase
     n = n.lower()
     # Strip :latest
-    if n.endswith(':latest'):
+    if n.endswith(":latest"):
         n = n[:-7]
     # Strip quantization suffixes (Q4_K_M, q8_0, etc.)
-    n = _QUANT_RE.sub('', n)
+    n = _QUANT_RE.sub("", n)
     # Strip instruction-tuned marker
-    if n.endswith('-it'):
+    if n.endswith("-it"):
         n = n[:-3]
     # Normalize family-size pattern: "qwen3.5-27b" -> "qwen3.5:27b"
     m = _SIZE_RE.match(n)
     if m:
-        n = m.group(1) + ':' + m.group(2)
+        n = m.group(1) + ":" + m.group(2)
     return n
 
 
@@ -363,7 +381,9 @@ def _db_init():
         return
     try:
         os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-        _db_conn = sqlite3.connect(_DB_PATH, check_same_thread=False, isolation_level=None)
+        _db_conn = sqlite3.connect(
+            _DB_PATH, check_same_thread=False, isolation_level=None
+        )
         _db_conn.execute("PRAGMA journal_mode=WAL")
         _db_conn.execute("PRAGMA synchronous=NORMAL")
         _db_conn.execute(
@@ -417,8 +437,14 @@ def _db_load_recent(limit=2000):
             )
             rows = cur.fetchall()
         return [
-            {"ts": r[0], "model": r[1], "host": r[2], "capability": r[3],
-             "latency_ms": r[4], "ok": bool(r[5])}
+            {
+                "ts": r[0],
+                "model": r[1],
+                "host": r[2],
+                "capability": r[3],
+                "latency_ms": r[4],
+                "ok": bool(r[5]),
+            }
             for r in reversed(rows)
         ]
     except Exception as e:
@@ -438,8 +464,14 @@ def _db_query_since(since):
             )
             rows = cur.fetchall()
         return [
-            {"ts": r[0], "model": r[1], "host": r[2], "capability": r[3],
-             "latency_ms": r[4], "ok": bool(r[5])}
+            {
+                "ts": r[0],
+                "model": r[1],
+                "host": r[2],
+                "capability": r[3],
+                "latency_ms": r[4],
+                "ok": bool(r[5]),
+            }
             for r in rows
         ]
     except Exception as e:
@@ -459,7 +491,9 @@ def _db_prune_loop():
                 cur = _db_conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff,))
                 deleted = cur.rowcount
             if deleted > 0:
-                print(f"[caproute] pruned {deleted} history rows older than {_DB_RETENTION_DAYS}d")
+                print(
+                    f"[caproute] pruned {deleted} history rows older than {_DB_RETENTION_DAYS}d"
+                )
         except Exception as e:
             print(f"[caproute] prune failed: {e}")
 
@@ -840,7 +874,10 @@ def _probe_backend(backend):
         # Only update latency if no actual request latency is already tracked.
         # Passive /api/ps latency is network-only, not inference latency.
         state = _get_backend_state(key)
-        if state.get("last_success", 0) == 0 or (time.time() - state.get("last_success", 0)) > 600:
+        if (
+            state.get("last_success", 0) == 0
+            or (time.time() - state.get("last_success", 0)) > 600
+        ):
             # No recent real traffic — record passive latency as baseline
             _record_success(key, latency_ms)
         else:
@@ -994,6 +1031,13 @@ DEFAULT_FALLBACKS = {
     "reasoning-fast": ("thinking", {"reasoning_effort": "low"}),
 }
 
+# Per-capability param overrides injected on EVERY request for that capability
+# (unlike fallback overrides which only apply on escalation).
+# Client-supplied params always win over these defaults.
+CAPABILITY_OVERRIDES = {
+    "light": {"reasoning_effort": "none"},
+}
+
 
 def _normalize_fallback(value):
     """Accept either string (legacy) or (target, overrides) tuple. Returns tuple."""
@@ -1135,7 +1179,9 @@ def resolve_capability(capability, session_id=None):
             current = next_cap
 
         for fallback_cap, fallback_overrides in chain:
-            fb_backends = _resolve_capability_backends(fallback_cap, session_id=session_id)
+            fb_backends = _resolve_capability_backends(
+                fallback_cap, session_id=session_id
+            )
             if fb_backends and _has_healthy_backend(fb_backends):
                 backends = fb_backends
                 actual_cap = fallback_cap
@@ -1247,8 +1293,8 @@ def _has_free_slot(base_url, api_type, model_name=None, timeout=2):
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             slots = json.loads(resp.read())
-        if not isinstance(slots, list):
-            return True
+        if not isinstance(slots, list) or len(slots) == 0:
+            return True  # empty or unknown = assume available
         free = sum(1 for s in slots if not s.get("is_processing", False))
         return free > 0
     except Exception:
@@ -1265,25 +1311,37 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
                      This covers the actual LLM generation time.
     """
     import http.client
+
     parsed = urllib.parse.urlparse(url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     if parsed.scheme == "https":
-        conn = http.client.HTTPSConnection(parsed.hostname, port, timeout=connect_timeout)
+        conn = http.client.HTTPSConnection(
+            parsed.hostname, port, timeout=connect_timeout
+        )
     else:
-        conn = http.client.HTTPConnection(parsed.hostname, port, timeout=connect_timeout)
+        conn = http.client.HTTPConnection(
+            parsed.hostname, port, timeout=connect_timeout
+        )
     try:
         conn.connect()  # uses connect_timeout
         conn.sock.settimeout(read_timeout)  # switch to full timeout for generation
-        conn.request("POST", parsed.path, body=body_bytes,
-                     headers={
-                         "Content-Type": "application/json",
-                         "X-No-Queue": "1",  # tell proxies to reject immediately if busy
-                     })
+        conn.request(
+            "POST",
+            parsed.path,
+            body=body_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "X-No-Queue": "1",  # tell proxies to reject immediately if busy
+            },
+        )
         resp = conn.getresponse()
         if resp.status >= 400:
             raise urllib.error.HTTPError(
-                url, resp.status, http.client.responses.get(resp.status, ""),
-                resp.msg, None,
+                url,
+                resp.status,
+                http.client.responses.get(resp.status, ""),
+                resp.msg,
+                None,
             )
         return json.loads(resp.read())
     finally:
@@ -1313,7 +1371,8 @@ def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=No
     usage = {
         "prompt_tokens": result.get("prompt_eval_count", 0),
         "completion_tokens": result.get("eval_count", 0),
-        "total_tokens": result.get("prompt_eval_count", 0) + result.get("eval_count", 0),
+        "total_tokens": result.get("prompt_eval_count", 0)
+        + result.get("eval_count", 0),
     }
     return _wrap_openai_response(model, content, tool_calls, usage=usage)
 
@@ -1370,19 +1429,28 @@ def _wrap_openai_response(model, content, tool_calls=None, usage=None):
                 "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
-        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage
+        or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
 def proxy_to_backend(backend, messages, params, timeout, connect_timeout=None):
     if backend["api"] == "ollama":
         return _proxy_ollama(
-            backend["base_url"], backend["name"], messages, params, timeout,
+            backend["base_url"],
+            backend["name"],
+            messages,
+            params,
+            timeout,
             connect_timeout=connect_timeout,
         )
     else:
         return _proxy_openai(
-            backend["base_url"], backend["name"], messages, params, timeout,
+            backend["base_url"],
+            backend["name"],
+            messages,
+            params,
+            timeout,
             connect_timeout=connect_timeout,
         )
 
@@ -2082,7 +2150,11 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 content_chunk = {
                     **chunk_base,
                     "choices": [
-                        {"index": 0, "delta": {"content": content}, "finish_reason": None}
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
                     ],
                 }
                 self.wfile.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
@@ -2107,7 +2179,11 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     tc_chunk = {
                         **chunk_base,
                         "choices": [
-                            {"index": 0, "delta": {"tool_calls": [tc_delta]}, "finish_reason": None}
+                            {
+                                "index": 0,
+                                "delta": {"tool_calls": [tc_delta]},
+                                "finish_reason": None,
+                            }
                         ],
                     }
                     self.wfile.write(f"data: {json.dumps(tc_chunk)}\n\n".encode())
@@ -2154,7 +2230,6 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/config/status":
             self._handle_config_status()
         elif self.path == "/":
-
             self._send_json({"status": "caproute running", "mode": "probe-routing"})
         else:
             self._send_json({"error": "not found"}, 404)
@@ -2285,8 +2360,10 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             "key": k,
                             "last_used_age_s": round(now - ts, 1),
                             "stickiness": (
-                                "strong" if now - ts < _AFFINITY_STRONG_WINDOW_S
-                                else "mild" if now - ts < _AFFINITY_MILD_WINDOW_S
+                                "strong"
+                                if now - ts < _AFFINITY_STRONG_WINDOW_S
+                                else "mild"
+                                if now - ts < _AFFINITY_MILD_WINDOW_S
                                 else "expired"
                             ),
                         }
@@ -2304,9 +2381,14 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
         per_backend = {}
         for entry in routing_log:
             sid = entry["session_id"]
-            ps = per_session.setdefault(sid, {
-                "requests": 0, "with_affinity": 0, "total_bonus": 0,
-            })
+            ps = per_session.setdefault(
+                sid,
+                {
+                    "requests": 0,
+                    "with_affinity": 0,
+                    "total_bonus": 0,
+                },
+            )
             ps["requests"] += 1
             if entry["affinity_bonus"] > 0:
                 ps["with_affinity"] += 1
@@ -2314,20 +2396,22 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             pb = per_backend.setdefault(entry["backend"], {"requests": 0})
             pb["requests"] += 1
 
-        self._send_json({
-            "config": {
-                "strong_window_s": _AFFINITY_STRONG_WINDOW_S,
-                "mild_window_s": _AFFINITY_MILD_WINDOW_S,
-                "strong_bonus": _AFFINITY_STRONG_BONUS,
-                "mild_bonus": _AFFINITY_MILD_BONUS,
-                "max_sessions": _AFFINITY_MAX_SESSIONS,
-            },
-            "active_sessions": len(sessions),
-            "sessions": sessions,
-            "per_session_routing": per_session,
-            "per_backend_routing": per_backend,
-            "total_routing_decisions": len(routing_log),
-        })
+        self._send_json(
+            {
+                "config": {
+                    "strong_window_s": _AFFINITY_STRONG_WINDOW_S,
+                    "mild_window_s": _AFFINITY_MILD_WINDOW_S,
+                    "strong_bonus": _AFFINITY_STRONG_BONUS,
+                    "mild_bonus": _AFFINITY_MILD_BONUS,
+                    "max_sessions": _AFFINITY_MAX_SESSIONS,
+                },
+                "active_sessions": len(sessions),
+                "sessions": sessions,
+                "per_session_routing": per_session,
+                "per_backend_routing": per_backend,
+                "total_routing_decisions": len(routing_log),
+            }
+        )
 
     def _handle_routing_log(self):
         """Raw routing log (last N decisions)."""
@@ -2401,12 +2485,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 params[key] = req[key]
 
         # Inject a sensible max_tokens default when client omits it.
-        # llama-server's OpenAI adapter defaults to 4096, which causes thinking
-        # models to truncate (reasoning alone can hit 4K, leaving ~0 for answer).
-        # Based on 2026-04-05 overnight experiment: p95 of reasoning+answer ≈ 5700.
-        # 8192 gives safety margin while staying under Qwen3 16K training ceiling.
-        if "max_tokens" not in params:
-            params["max_tokens"] = 8192
+        # (Disabled by user request to let backend decide)
+        # if "max_tokens" not in params:
+        #     params["max_tokens"] = 8192
 
         # Compute session identifier for affinity tracking (cache warmth).
         session_id = _compute_session_id(req)
@@ -2453,13 +2534,19 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 visited_caps_this_round.add(current_cap)
 
                 # Resolve: capability name or direct model name
-                backends, actual_cap, hop_overrides = resolve_capability(current_cap, session_id=session_id)
+                backends, actual_cap, hop_overrides = resolve_capability(
+                    current_cap, session_id=session_id
+                )
                 if hop_overrides:
                     accumulated_overrides = {**accumulated_overrides, **hop_overrides}
 
                 # If the user explicitly requested "thinking" and no backends are healthy,
                 # keep the actual backends so proxy_to_backend can wait for them.
-                if actual_cap == "thinking" and not _has_healthy_backend(backends) and current_cap == model_field:
+                if (
+                    actual_cap == "thinking"
+                    and not _has_healthy_backend(backends)
+                    and current_cap == model_field
+                ):
                     backends = _resolve_capability_backends("thinking")
 
                 if not backends and current_cap == model_field:
@@ -2479,7 +2566,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         break
 
                 # Use the shorter of per-attempt timeout or remaining budget.
-                attempt_timeout = min(_PER_ATTEMPT_TIMEOUT, _total_deadline - time.time())
+                attempt_timeout = min(
+                    _PER_ATTEMPT_TIMEOUT, _total_deadline - time.time()
+                )
                 if attempt_timeout <= 0:
                     break
 
@@ -2489,21 +2578,28 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 # Filter out backends with hard errors (won't work for this request)
                 # and soft errors (server error, skip this round). Timeouts are
                 # NOT filtered — the backend was working, just slow.
-                fresh_backends = [b for b in backends
-                                  if _backend_key(b["host"], b["name"]) not in _hard_failed_keys
-                                  and _backend_key(b["host"], b["name"]) not in _soft_failed_keys]
+                fresh_backends = [
+                    b
+                    for b in backends
+                    if _backend_key(b["host"], b["name"]) not in _hard_failed_keys
+                    and _backend_key(b["host"], b["name"]) not in _soft_failed_keys
+                ]
                 if not fresh_backends:
                     break  # all backends exhausted this round
 
                 _slot_available = []
                 _slot_busy = []
                 for backend in fresh_backends:
-                    if _has_free_slot(backend["base_url"], backend["api"], backend["name"]):
+                    if _has_free_slot(
+                        backend["base_url"], backend["api"], backend["name"]
+                    ):
                         _slot_available.append(backend)
                     else:
                         _slot_busy.append(backend)
                 if _slot_busy:
-                    _busy_names = ", ".join(f"{b['name']}@{b['host']}" for b in _slot_busy)
+                    _busy_names = ", ".join(
+                        f"{b['name']}@{b['host']}" for b in _slot_busy
+                    )
                     print(f"[caproute] slots full, deferring: {_busy_names}")
                 if not _slot_available:
                     # All slots busy — don't queue, escalate or retry next round.
@@ -2522,18 +2618,35 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         print(
                             f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag}{round_tag} t={attempt_timeout:.0f}s sess={session_id})"
                         )
-                        call_params = {**accumulated_overrides, **params}
-                        result = proxy_to_backend(backend, messages, call_params, timeout,
-                                                  connect_timeout=attempt_timeout)
+                        # Layer: capability defaults < fallback overrides < client params
+                        cap_overrides = CAPABILITY_OVERRIDES.get(actual_cap, {})
+                        call_params = {**cap_overrides, **accumulated_overrides, **params}
+                        result = proxy_to_backend(
+                            backend,
+                            messages,
+                            call_params,
+                            timeout,
+                            connect_timeout=attempt_timeout,
+                        )
                         latency_ms = (time.time() - t0) * 1000
                         _record_success(key, latency_ms)
-                        _record_request(backend["name"], backend["host"], actual_cap, latency_ms, True)
+                        _record_request(
+                            backend["name"],
+                            backend["host"],
+                            actual_cap,
+                            latency_ms,
+                            True,
+                        )
                         _record_session_usage(session_id, key)
                         _usage = result.get("usage", {})
                         _log_routing(
-                            session_id, actual_cap, key,
-                            backend["_score"], backend.get("_base_score", backend["_score"]),
-                            aff_bonus, len(backends),
+                            session_id,
+                            actual_cap,
+                            key,
+                            backend["_score"],
+                            backend.get("_base_score", backend["_score"]),
+                            aff_bonus,
+                            len(backends),
                             latency_ms=latency_ms,
                             prompt_tokens=_usage.get("prompt_tokens", 0),
                             completion_tokens=_usage.get("completion_tokens", 0),
@@ -2555,7 +2668,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     except Exception as e:
                         latency_ms = (time.time() - t0) * 1000
                         _record_failure(key)
-                        _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
+                        _record_request(
+                            backend["name"],
+                            backend["host"],
+                            actual_cap,
+                            latency_ms,
+                            False,
+                        )
                         # Categorize error to decide retry strategy:
                         # 400 = bad request (context too large) → never retry this request
                         # 500 = server error → skip this round, retry next round
@@ -2576,13 +2695,25 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 # All backends failed for current capability. Escalate.
                 cfg = load_config()
                 fallbacks = _get_fallbacks(cfg)
-                if actual_cap in fallbacks and fallbacks[actual_cap][0] not in visited_caps_this_round:
+                if (
+                    actual_cap in fallbacks
+                    and fallbacks[actual_cap][0] not in visited_caps_this_round
+                ):
                     next_cap, hop_overrides = fallbacks[actual_cap]
                     if hop_overrides:
-                        accumulated_overrides = {**accumulated_overrides, **hop_overrides}
+                        accumulated_overrides = {
+                            **accumulated_overrides,
+                            **hop_overrides,
+                        }
                     current_cap = next_cap
-                    ov_str = f" overrides={accumulated_overrides}" if accumulated_overrides else ""
-                    print(f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}{ov_str}...")
+                    ov_str = (
+                        f" overrides={accumulated_overrides}"
+                        if accumulated_overrides
+                        else ""
+                    )
+                    print(
+                        f"[caproute] all backends failed for {actual_cap}, mid-flight escalation -> {current_cap}{ov_str}..."
+                    )
                     continue
                 else:
                     break
@@ -2591,7 +2722,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             # Loop back for another round with fresh scores.
             if time.time() < _total_deadline:
                 wait = min(2.0, _total_deadline - time.time())
-                print(f"[caproute] round {_round} exhausted, retrying in {wait:.0f}s ({_total_deadline - time.time():.0f}s left)...")
+                print(
+                    f"[caproute] round {_round} exhausted, retrying in {wait:.0f}s ({_total_deadline - time.time():.0f}s left)..."
+                )
                 time.sleep(wait)
 
         self._send_json(
@@ -2643,7 +2776,9 @@ def main():
         recent = _db_load_recent(limit=_request_history.maxlen)
         with _history_lock:
             _request_history.extend(recent)
-        print(f"[caproute] DB: {_DB_PATH} (retention {_DB_RETENTION_DAYS}d, loaded {len(recent)} recent entries)")
+        print(
+            f"[caproute] DB: {_DB_PATH} (retention {_DB_RETENTION_DAYS}d, loaded {len(recent)} recent entries)"
+        )
         threading.Thread(target=_db_prune_loop, daemon=True).start()
     else:
         print(f"[caproute] DB: disabled (init failed)")
@@ -2668,7 +2803,9 @@ def main():
     if sync_peers:
         s = threading.Thread(target=_sync_loop, daemon=True)
         s.start()
-        print(f"[caproute] Config sync: {len(sync_peers)} peers, interval {SYNC_INTERVAL}s")
+        print(
+            f"[caproute] Config sync: {len(sync_peers)} peers, interval {SYNC_INTERVAL}s"
+        )
     else:
         print(f"[caproute] Config sync: disabled (no sync_peers in config)")
 
