@@ -986,6 +986,7 @@ def _get_hosts(cfg):
 #
 # Backward compat: string values (old format) are treated as (target, {}).
 DEFAULT_FALLBACKS = {
+    "light": ("adequate", {}),
     "fast": ("adequate", {}),
     "adequate": ("powerful", {}),
     "powerful": ("thinking", {}),
