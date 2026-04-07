@@ -1234,28 +1234,24 @@ def _extract_content(result):
 def _has_free_slot(base_url, api_type, model_name=None, timeout=2):
     """Check if a backend has a free inference slot.
 
-    For llama-server (openai API): GET /slots -> [{is_processing: bool}, ...]
-    For llama-proxy (ollama API): need to hit the per-model llama-server port,
-        but we can try /slots on the proxy too — returns 400 if no model specified.
-        Fall through to "assume available" for backends that don't expose /slots.
+    Queries GET /slots on llama-server and compatible proxies.
+    For ollama backends without /slots support, assumes available.
 
     Returns True if at least one slot is free, or if we can't determine (assume yes).
     """
     try:
         if api_type == "ollama":
-            # Ollama/llama-proxy doesn't expose /slots per-model easily.
-            # Assume available — the actual request will fail fast (500/400) if not.
             return True
         url = base_url.rstrip("/") + "/slots"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             slots = json.loads(resp.read())
         if not isinstance(slots, list):
-            return True  # unknown format, assume available
+            return True
         free = sum(1 for s in slots if not s.get("is_processing", False))
         return free > 0
     except Exception:
-        return True  # can't check, assume available
+        return True
 
 
 def _http_post(url, body_bytes, connect_timeout, read_timeout):
@@ -2442,6 +2438,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
 
             current_cap = model_field
             visited_caps_this_round = set()
+            _failed_keys_this_round = set()  # backends that already failed this round
 
             while True:
                 visited_caps_this_round.add(current_cap)
@@ -2480,9 +2477,17 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 # Separate backends into slot-available vs slot-busy.
                 # Try slot-available first (including affinity-preferred).
                 # If ALL are busy, skip to next round instead of queuing.
+                # Filter out backends that already failed this round (prevents
+                # retry storms when a backend returns instant errors and appears
+                # in multiple capability tiers via the fallback chain).
+                fresh_backends = [b for b in backends
+                                  if _backend_key(b["host"], b["name"]) not in _failed_keys_this_round]
+                if not fresh_backends:
+                    break  # all backends exhausted this round
+
                 _slot_available = []
                 _slot_busy = []
-                for backend in backends:
+                for backend in fresh_backends:
                     if _has_free_slot(backend["base_url"], backend["api"], backend["name"]):
                         _slot_available.append(backend)
                     else:
@@ -2492,7 +2497,6 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     print(f"[caproute] slots full, deferring: {_busy_names}")
                 if not _slot_available:
                     # All slots busy — don't queue, escalate or retry next round.
-                    # This avoids burning the full read timeout waiting in a queue.
                     break
 
                 for backend in _slot_available:
@@ -2542,6 +2546,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         latency_ms = (time.time() - t0) * 1000
                         _record_failure(key)
                         _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
+                        _failed_keys_this_round.add(key)
                         err = f"{backend['name']}@{backend['host']}: {e}"
                         print(f"[caproute] FAIL {err}")
                         errors.append(err)
