@@ -1331,7 +1331,6 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
             body=body_bytes,
             headers={
                 "Content-Type": "application/json",
-                "X-No-Queue": "1",  # tell proxies to reject immediately if busy
             },
         )
         resp = conn.getresponse()
