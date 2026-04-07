@@ -1035,7 +1035,7 @@ DEFAULT_FALLBACKS = {
 # (unlike fallback overrides which only apply on escalation).
 # Client-supplied params always win over these defaults.
 CAPABILITY_OVERRIDES = {
-    "light": {"reasoning_effort": "none"},
+    "light": {"reasoning_effort": "none", "think": False},
 }
 
 
@@ -1361,6 +1361,9 @@ def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=No
         data["options"]["num_predict"] = params["max_tokens"]
     if params.get("tools") is not None:
         data["tools"] = params["tools"]
+    # Ollama-specific: think parameter controls reasoning on/off
+    if "think" in params:
+        data["think"] = params["think"]
 
     ct = connect_timeout or timeout
     result = _http_post(url, json.dumps(data).encode(), ct, timeout)
