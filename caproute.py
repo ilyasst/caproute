@@ -1274,7 +1274,10 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
         conn.connect()  # uses connect_timeout
         conn.sock.settimeout(read_timeout)  # switch to full timeout for generation
         conn.request("POST", parsed.path, body=body_bytes,
-                     headers={"Content-Type": "application/json"})
+                     headers={
+                         "Content-Type": "application/json",
+                         "X-No-Queue": "1",  # tell proxies to reject immediately if busy
+                     })
         resp = conn.getresponse()
         if resp.status >= 400:
             raise urllib.error.HTTPError(
@@ -2438,7 +2441,12 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
 
             current_cap = model_field
             visited_caps_this_round = set()
-            _failed_keys_this_round = set()  # backends that already failed this round
+            # Track backends that returned hard errors this round.
+            # HTTP 400 = bad request (context too large, etc.) — permanent for this request.
+            # HTTP 500 = server error — transient but skip for this round.
+            # Timeouts are NOT tracked here — the backend was working, just slow.
+            _hard_failed_keys = set()  # 400s — won't work for this request at all
+            _soft_failed_keys = set()  # 500s — skip this round only
 
             while True:
                 visited_caps_this_round.add(current_cap)
@@ -2477,11 +2485,12 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 # Separate backends into slot-available vs slot-busy.
                 # Try slot-available first (including affinity-preferred).
                 # If ALL are busy, skip to next round instead of queuing.
-                # Filter out backends that already failed this round (prevents
-                # retry storms when a backend returns instant errors and appears
-                # in multiple capability tiers via the fallback chain).
+                # Filter out backends with hard errors (won't work for this request)
+                # and soft errors (server error, skip this round). Timeouts are
+                # NOT filtered — the backend was working, just slow.
                 fresh_backends = [b for b in backends
-                                  if _backend_key(b["host"], b["name"]) not in _failed_keys_this_round]
+                                  if _backend_key(b["host"], b["name"]) not in _hard_failed_keys
+                                  and _backend_key(b["host"], b["name"]) not in _soft_failed_keys]
                 if not fresh_backends:
                     break  # all backends exhausted this round
 
@@ -2546,7 +2555,17 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         latency_ms = (time.time() - t0) * 1000
                         _record_failure(key)
                         _record_request(backend["name"], backend["host"], actual_cap, latency_ms, False)
-                        _failed_keys_this_round.add(key)
+                        # Categorize error to decide retry strategy:
+                        # 400 = bad request (context too large) → never retry this request
+                        # 500 = server error → skip this round, retry next round
+                        # timeout = backend was working but slow → don't skip
+                        err_str = str(e)
+                        if "400" in err_str:
+                            _hard_failed_keys.add(key)
+                        elif "500" in err_str or "502" in err_str or "503" in err_str:
+                            _soft_failed_keys.add(key)
+                        # Timeouts and connection errors: don't add to failed sets
+                        # (backend may recover, or other slot may be free)
                         err = f"{backend['name']}@{backend['host']}: {e}"
                         print(f"[caproute] FAIL {err}")
                         errors.append(err)
