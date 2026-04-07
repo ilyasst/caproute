@@ -4,6 +4,8 @@ Capability-routing LLM gateway. Ask for what you need (`"powerful"`, `"fast"`, `
 
 Speaks OpenAI API. Zero dependencies (stdlib Python only). Designed for self-hosted LLM setups across multiple machines (e.g. Tailscale).
 
+**Roadmap:** Add NostrVPN as an alternative to Tailscale for mesh networking. NostrVPN offers a decentralized approach with no central authority, appealing for privacy-conscious setups.
+
 ## How it works
 
 caproute uses **probe-routing**: a background thread continuously pings every backend every 5 seconds to know their real-time health. Routing goes directly to the best available backend — no wasted timeouts on dead or overloaded ones.
