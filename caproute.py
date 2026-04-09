@@ -48,6 +48,57 @@ IDLE_PROBE_INTERVAL = int(os.environ.get("CAPROUTE_IDLE_PROBE_INTERVAL", "60"))
 DOWN_RETRY_INTERVAL = int(os.environ.get("CAPROUTE_DOWN_RETRY_INTERVAL", "30"))
 SYNC_INTERVAL = int(os.environ.get("CAPROUTE_SYNC_INTERVAL", "60"))
 
+# ── Tailscale IP → hostname resolver ─────────────────────────────────
+_ts_names = {}  # ip -> hostname
+_ts_names_lock = threading.Lock()
+_TS_REFRESH_INTERVAL = 300  # refresh every 5 minutes
+
+
+def _refresh_tailscale_names():
+    """Build IP→hostname map from `tailscale status --json`."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["tailscale", "status", "--json"], timeout=5, stderr=subprocess.DEVNULL
+        )
+        data = json.loads(out)
+        names = {}
+        # Self node
+        self_node = data.get("Self", {})
+        for ip in self_node.get("TailscaleIPs", []):
+            if ":" not in ip:  # skip IPv6
+                names[ip] = self_node.get("HostName", "self")
+        # Peers
+        for peer in data.get("Peer", {}).values():
+            hostname = peer.get("HostName", "")
+            if not hostname:
+                continue
+            for ip in peer.get("TailscaleIPs", []):
+                if ":" not in ip:
+                    names[ip] = hostname.lower()
+        with _ts_names_lock:
+            _ts_names.clear()
+            _ts_names.update(names)
+    except Exception:
+        pass  # tailscale not available — use raw IPs
+
+
+def _resolve_client(ip):
+    """Resolve an IP to a Tailscale hostname, or return the IP as-is."""
+    with _ts_names_lock:
+        if ip == "127.0.0.1" or ip == "::1":
+            import socket
+            return socket.gethostname().lower()
+        return _ts_names.get(ip, ip)
+
+
+def _ts_refresher():
+    """Background thread that refreshes Tailscale names periodically."""
+    while True:
+        _refresh_tailscale_names()
+        time.sleep(_TS_REFRESH_INTERVAL)
+
+
 # ── Config sync state ───────────────────────────────────────────────
 _sync_state = {
     "last_poll": 0,
@@ -282,6 +333,7 @@ def _log_routing(
     latency_ms=0,
     prompt_tokens=0,
     completion_tokens=0,
+    client="",
 ):
     """Record a routing decision for offline analysis.
 
@@ -302,6 +354,7 @@ def _log_routing(
                 "latency_ms": round(latency_ms),
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "client": client,
             }
         )
 
@@ -345,7 +398,7 @@ def normalize_model_name(name):
     return n
 
 
-def _record_request(model, host, capability, latency_ms, success, start_ts=None):
+def _record_request(model, host, capability, latency_ms, success, start_ts=None, client=""):
     """Append a request record to the ring buffer and persistent SQLite store."""
     now = time.time()
     entry = {
@@ -356,6 +409,7 @@ def _record_request(model, host, capability, latency_ms, success, start_ts=None)
         "capability": capability,
         "latency_ms": round(latency_ms),
         "ok": success,
+        "client": client,
     }
     with _history_lock:
         _request_history.append(entry)
@@ -408,6 +462,10 @@ def _db_init():
             _db_conn.execute("ALTER TABLE requests ADD COLUMN start_ts REAL")
         except Exception:
             pass  # already exists
+        try:
+            _db_conn.execute("ALTER TABLE requests ADD COLUMN client TEXT DEFAULT ''")
+        except Exception:
+            pass  # already exists
     except Exception as e:
         print(f"[caproute] db init failed ({_DB_PATH}): {e}")
         _db_conn = None
@@ -420,7 +478,7 @@ def _db_record_request(entry):
     try:
         with _db_lock:
             _db_conn.execute(
-                "INSERT INTO requests(ts,start_ts,model,host,capability,latency_ms,ok) VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO requests(ts,start_ts,model,host,capability,latency_ms,ok,client) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     entry["ts"],
                     entry.get("start_ts", entry["ts"]),
@@ -429,6 +487,7 @@ def _db_record_request(entry):
                     entry["capability"],
                     entry["latency_ms"],
                     1 if entry["ok"] else 0,
+                    entry.get("client", ""),
                 ),
             )
     except Exception as e:
@@ -2555,6 +2614,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON"}, 400)
             return
 
+        client_ip = self.client_address[0]
+        client_name = _resolve_client(client_ip)
+
         model_field = req.get("model", "")
         messages = req.get("messages", [])
         if not messages:
@@ -2723,8 +2785,9 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         aff_bonus = backend.get("_affinity_bonus", 0)
                         aff_tag = f" aff=-{aff_bonus:.0f}" if aff_bonus else ""
                         round_tag = f" r={_round}" if _round > 1 else ""
+                        client_tag = f" from={client_name}" if client_name != client_ip else f" from={client_ip}"
                         print(
-                            f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag}{round_tag} t={attempt_timeout:.0f}s sess={session_id})"
+                            f"[caproute] {model_field} -> {backend['name']}@{backend['host']} (score={backend['_score']:.0f}{aff_tag}{round_tag} t={attempt_timeout:.0f}s{client_tag} sess={session_id})"
                         )
                         # Layer: capability defaults < fallback overrides < client params
                         cap_overrides = CAPABILITY_OVERRIDES.get(actual_cap, {})
@@ -2745,6 +2808,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             latency_ms,
                             True,
                             start_ts=t0,
+                            client=client_name,
                         )
                         _record_session_usage(session_id, key)
                         _usage = result.get("usage", {})
@@ -2759,6 +2823,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             latency_ms=latency_ms,
                             prompt_tokens=_usage.get("prompt_tokens", 0),
                             completion_tokens=_usage.get("completion_tokens", 0),
+                            client=client_name,
                         )
                         result["_caproute"] = {
                             "capability": actual_cap,
@@ -2768,6 +2833,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             "latency_ms": round(latency_ms),
                             "score": round(backend["_score"]),
                             "round": _round,
+                            "client": client_name,
                         }
                         if req.get("stream", False):
                             self._send_sse(result)
@@ -2784,6 +2850,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             latency_ms,
                             False,
                             start_ts=t0,
+                            client=client_name,
                         )
                         # Categorize error to decide retry strategy:
                         # 400 = bad request (context too large) → never retry this request
@@ -2958,6 +3025,11 @@ def main():
     w.start()
     stuck_threshold = int(os.environ.get("CAPROUTE_STUCK_THRESHOLD", "300"))
     print(f"[caproute] Stuck-request watchdog: threshold={stuck_threshold}s, check every 30s")
+
+    # Tailscale IP→hostname resolver
+    _refresh_tailscale_names()  # initial load
+    threading.Thread(target=_ts_refresher, daemon=True).start()
+    print(f"[caproute] Tailscale resolver: {len(_ts_names)} hosts, refresh every {_TS_REFRESH_INTERVAL}s")
 
     # Background config sync thread
     sync_peers = cfg.get("sync_peers", [])
