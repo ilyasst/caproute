@@ -1145,8 +1145,7 @@ def _get_hosts(cfg):
 DEFAULT_FALLBACKS = {
     "light": ("adequate", {}),
     "fast": ("adequate", {}),
-    "adequate": ("powerful", {}),
-    "powerful": ("thinking", {}),
+    "adequate": ("thinking", {}),
     "style": ("adequate", {}),
     "reasoning-fast": ("thinking", {"reasoning_effort": "low"}),
 }
@@ -2760,7 +2759,36 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         )
                         return
                     else:
-                        break
+                        # No backends for this escalation target — walk the
+                        # fallback chain further instead of giving up.
+                        cfg2 = load_config()
+                        fbs = _get_fallbacks(cfg2)
+                        _skip_cap = current_cap
+                        _found_next = False
+                        while (
+                            _skip_cap in fbs
+                            and fbs[_skip_cap][0] not in visited_caps_this_round
+                        ):
+                            next_cap, hop_ov = fbs[_skip_cap]
+                            visited_caps_this_round.add(_skip_cap)
+                            if hop_ov:
+                                accumulated_overrides = {**accumulated_overrides, **hop_ov}
+                            _next_backends = _resolve_capability_backends(next_cap)
+                            if _next_backends:
+                                current_cap = next_cap
+                                print(
+                                    f"[caproute] {_skip_cap} has no backends, "
+                                    f"skipping to {current_cap}"
+                                )
+                                _found_next = True
+                                break
+                            print(
+                                f"[caproute] {next_cap} has no backends, skipping"
+                            )
+                            _skip_cap = next_cap
+                        if _found_next:
+                            continue  # inner while — retry with new capability
+                        break  # chain exhausted
 
                 # Use the shorter of per-attempt timeout or remaining budget.
                 attempt_timeout = min(
@@ -2799,23 +2827,38 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     )
                     print(f"[caproute] slots full, deferring: {_busy_names}")
                 if not _slot_available:
-                    # All slots busy. Escalate immediately if a fallback exists,
-                    # so we don't spin-wait for 210s on a fully-loaded tier.
+                    # All slots busy. Walk the fallback chain to find a
+                    # capability that has backends with free slots.
+                    # Skip capabilities with no backends (machine offline, etc).
                     cfg2 = load_config()
                     fbs = _get_fallbacks(cfg2)
-                    if (
-                        actual_cap in fbs
-                        and fbs[actual_cap][0] not in visited_caps_this_round
+                    _esc_cap = actual_cap
+                    _found_fallback = False
+                    while (
+                        _esc_cap in fbs
+                        and fbs[_esc_cap][0] not in visited_caps_this_round
                     ):
-                        next_cap, hop_ov = fbs[actual_cap]
+                        next_cap, hop_ov = fbs[_esc_cap]
                         if hop_ov:
                             accumulated_overrides = {**accumulated_overrides, **hop_ov}
-                        visited_caps_this_round.add(actual_cap)
+                        visited_caps_this_round.add(_esc_cap)
+                        # Check if target has any backends at all
+                        _fb_backends = _resolve_capability_backends(next_cap)
+                        if not _fb_backends:
+                            print(
+                                f"[caproute] slots full for {_esc_cap}, "
+                                f"skipping {next_cap} (no backends)"
+                            )
+                            _esc_cap = next_cap
+                            continue
                         current_cap = next_cap
                         print(
                             f"[caproute] slots full for {actual_cap}, "
                             f"escalating -> {current_cap}"
                         )
+                        _found_fallback = True
+                        break
+                    if _found_fallback:
                         continue  # inner while — try next capability immediately
                     break  # no fallback available, break to outer retry loop
 
