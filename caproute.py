@@ -166,6 +166,8 @@ _backend_lock = threading.Lock()
 # ── Concurrency tracking ─────────────────────────────────────────────
 _in_flight_lock = threading.Lock()
 _in_flight = {}  # "host:model" -> int
+_in_flight_since = {}  # "host:model" -> [t0, t1, ...]  (one timestamp per request)
+_active_conns = {}   # "host:model" -> [conn, ...]  (http.client.HTTPConnection objects)
 
 # ── Session affinity (cache-warmth stickiness) ───────────────────────
 # Tracks which backend recently served each "session", so subsequent
@@ -343,10 +345,12 @@ def normalize_model_name(name):
     return n
 
 
-def _record_request(model, host, capability, latency_ms, success):
+def _record_request(model, host, capability, latency_ms, success, start_ts=None):
     """Append a request record to the ring buffer and persistent SQLite store."""
+    now = time.time()
     entry = {
-        "ts": time.time(),
+        "ts": now,
+        "start_ts": start_ts if start_ts is not None else now,
         "model": normalize_model_name(model),
         "host": host,
         "capability": capability,
@@ -390,6 +394,7 @@ def _db_init():
             """
             CREATE TABLE IF NOT EXISTS requests (
                 ts REAL NOT NULL,
+                start_ts REAL,
                 model TEXT NOT NULL,
                 host TEXT NOT NULL,
                 capability TEXT NOT NULL,
@@ -399,6 +404,10 @@ def _db_init():
             """
         )
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)")
+        try:
+            _db_conn.execute("ALTER TABLE requests ADD COLUMN start_ts REAL")
+        except Exception:
+            pass  # already exists
     except Exception as e:
         print(f"[caproute] db init failed ({_DB_PATH}): {e}")
         _db_conn = None
@@ -411,9 +420,10 @@ def _db_record_request(entry):
     try:
         with _db_lock:
             _db_conn.execute(
-                "INSERT INTO requests(ts,model,host,capability,latency_ms,ok) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO requests(ts,start_ts,model,host,capability,latency_ms,ok) VALUES (?,?,?,?,?,?,?)",
                 (
                     entry["ts"],
+                    entry.get("start_ts", entry["ts"]),
                     entry["model"],
                     entry["host"],
                     entry["capability"],
@@ -432,18 +442,19 @@ def _db_load_recent(limit=2000):
     try:
         with _db_lock:
             cur = _db_conn.execute(
-                "SELECT ts,model,host,capability,latency_ms,ok FROM requests ORDER BY ts DESC LIMIT ?",
+                "SELECT ts,start_ts,model,host,capability,latency_ms,ok FROM requests ORDER BY ts DESC LIMIT ?",
                 (limit,),
             )
             rows = cur.fetchall()
         return [
             {
                 "ts": r[0],
-                "model": r[1],
-                "host": r[2],
-                "capability": r[3],
-                "latency_ms": r[4],
-                "ok": bool(r[5]),
+                "start_ts": r[1] if r[1] is not None else r[0],
+                "model": r[2],
+                "host": r[3],
+                "capability": r[4],
+                "latency_ms": r[5],
+                "ok": bool(r[6]),
             }
             for r in reversed(rows)
         ]
@@ -459,18 +470,19 @@ def _db_query_since(since):
     try:
         with _db_lock:
             cur = _db_conn.execute(
-                "SELECT ts,model,host,capability,latency_ms,ok FROM requests WHERE ts > ? ORDER BY ts",
+                "SELECT ts,start_ts,model,host,capability,latency_ms,ok FROM requests WHERE ts > ? ORDER BY ts",
                 (since,),
             )
             rows = cur.fetchall()
         return [
             {
                 "ts": r[0],
-                "model": r[1],
-                "host": r[2],
-                "capability": r[3],
-                "latency_ms": r[4],
-                "ok": bool(r[5]),
+                "start_ts": r[1] if r[1] is not None else r[0],
+                "model": r[2],
+                "host": r[3],
+                "capability": r[4],
+                "latency_ms": r[5],
+                "ok": bool(r[6]),
             }
             for r in rows
         ]
@@ -614,6 +626,7 @@ def _record_idle(key):
 def _inc_in_flight(key):
     with _in_flight_lock:
         _in_flight[key] = _in_flight.get(key, 0) + 1
+        _in_flight_since.setdefault(key, []).append(time.time())
     with _backend_lock:
         if key in _backend_state:
             _backend_state[key]["in_flight"] = _in_flight.get(key, 0)
@@ -622,19 +635,59 @@ def _inc_in_flight(key):
 def _dec_in_flight(key):
     with _in_flight_lock:
         _in_flight[key] = max(0, _in_flight.get(key, 1) - 1)
+        ts_list = _in_flight_since.get(key, [])
+        if ts_list:
+            ts_list.pop(0)  # remove oldest timestamp (FIFO)
     with _backend_lock:
         if key in _backend_state:
             _backend_state[key]["in_flight"] = _in_flight.get(key, 0)
 
 
-def backend_score(key, session_id=None):
+def _get_oldest_in_flight_age(key):
+    """Returns seconds since oldest in-flight request was dispatched, or None."""
+    with _in_flight_lock:
+        ts_list = _in_flight_since.get(key, [])
+        if not ts_list:
+            return None
+        return time.time() - ts_list[0]
+
+
+# Per-capability in-flight penalty (ms per in-flight request).
+# Loaded from llm.json inflight_penalties at call time so changes
+# take effect without a restart (config is hot-reloaded).
+# Fallback hardcoded values used when config key is absent.
+_INFLIGHT_PENALTY_DEFAULTS = {
+    "fast": 3_000,
+    "light": 8_000,
+    "adequate": 20_000,
+    "thinking": 25_000,
+    "powerful": 25_000,
+    "reasoning-fast": 15_000,
+}
+_INFLIGHT_PENALTY_DEFAULT = 5_000
+
+
+def _get_inflight_penalty(capability):
+    """Return per-in-flight penalty for this capability, from config or defaults."""
+    try:
+        cfg = load_config()
+        penalties = cfg.get("inflight_penalties", {})
+        default = penalties.get("_default", _INFLIGHT_PENALTY_DEFAULT)
+        return penalties.get(capability, _INFLIGHT_PENALTY_DEFAULTS.get(capability, default))
+    except Exception:
+        return _INFLIGHT_PENALTY_DEFAULTS.get(capability, _INFLIGHT_PENALTY_DEFAULT)
+
+
+def backend_score(key, session_id=None, capability=None):
     """
     Score for routing. Lower = better.
     Combines: avg latency, consecutive failures, in-flight count, and
     (when session_id given) session affinity bonus that prefers recently-
     used backends for cache warmth.
 
-    Backward compatible: session_id is optional.
+    capability: when provided, scales the in-flight penalty to match the
+    typical latency of that capability so backends are not overloaded.
+    Backward compatible: session_id and capability are optional.
     """
     with _backend_lock:
         s = _backend_state.get(
@@ -659,12 +712,14 @@ def backend_score(key, session_id=None):
     # so transient outages don't permanently exclude backends
     score += min(failures, 6) * 5000
     # Penalty for in-flight requests (prefer less loaded backends).
-    # Higher penalty when backend is already slow/down to redirect load
-    # to idle backends faster.
+    # Penalty is scaled by capability to match expected request duration,
+    # so a single in-flight thinking request (30-50s) penalises a backend
+    # as heavily as ~8 fast requests.  Higher multiplier when slow/down.
+    _base_penalty = _get_inflight_penalty(capability)
     if status in ("slow", "down"):
-        score += in_flight * 8000
+        score += in_flight * max(_base_penalty, 8000)
     else:
-        score += in_flight * 3000
+        score += in_flight * _base_penalty
     # Penalty for idle (available but not loaded — will need cold-start)
     if status == "idle":
         score += 10000
@@ -833,6 +888,9 @@ def _passive_health_check_openai(backend):
     key = _backend_key(backend["host"], backend["name"])
     base_url = backend["base_url"].rstrip("/")
     # Try /slots first, then /health as fallback (some servers disable /slots)
+    # During prompt eval, llama-server returns 500 for /slots but /health may
+    # still work (especially through the proxy). Don't count a /slots 500 as a
+    # backend failure — fall through to /health first.
     for endpoint in ("/slots", "/health"):
         try:
             t0 = time.time()
@@ -844,6 +902,8 @@ def _passive_health_check_openai(backend):
             latency_ms = (time.time() - t0) * 1000
             _record_success(key, latency_ms)
             return latency_ms
+        except urllib.error.HTTPError:
+            continue  # 500 from /slots during prompt eval — try /health
         except Exception:
             continue
     _record_failure(key)
@@ -1123,8 +1183,8 @@ def _resolve_capability_backends(capability, session_id=None):
                 continue
 
             key = _backend_key(host_name, model_name)
-            base = backend_score(key, session_id=None)  # no affinity
-            score = backend_score(key, session_id=session_id)
+            base = backend_score(key, session_id=None, capability=capability)  # no affinity
+            score = backend_score(key, session_id=session_id, capability=capability)
             backends.append(
                 {
                     "name": model_name,
@@ -1284,7 +1344,9 @@ def _has_free_slot(base_url, api_type, model_name=None, timeout=2):
     Queries GET /slots on llama-server and compatible proxies.
     For ollama backends without /slots support, assumes available.
 
-    Returns True if at least one slot is free, or if we can't determine (assume yes).
+    Returns True if at least one slot is free.
+    Returns False if slots are busy OR if /slots errors/times out (during
+    prompt eval, llama-server returns 500 and can't serve /slots queries).
     """
     try:
         if api_type == "ollama":
@@ -1297,11 +1359,15 @@ def _has_free_slot(base_url, api_type, model_name=None, timeout=2):
             return True  # empty or unknown = assume available
         free = sum(1 for s in slots if not s.get("is_processing", False))
         return free > 0
+    except urllib.error.HTTPError:
+        return False  # 500 during prompt eval = treat as busy
+    except (TimeoutError, OSError):
+        return False  # timeout = backend too busy to respond
     except Exception:
-        return True
+        return True  # connection refused etc = backend may be restarting, let probe handle it
 
 
-def _http_post(url, body_bytes, connect_timeout, read_timeout):
+def _http_post(url, body_bytes, connect_timeout, read_timeout, backend_key=None):
     """POST with separate connect and read timeouts.
 
     connect_timeout: max seconds to establish TCP connection and send request.
@@ -1309,6 +1375,8 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
                      or unreachable, we fail fast.
     read_timeout:    max seconds to wait for the response body once connected.
                      This covers the actual LLM generation time.
+    backend_key:     if provided, registers the live conn in _active_conns so the
+                     stuck-request watchdog can close it without a full restart.
     """
     import http.client
 
@@ -1325,6 +1393,10 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
     try:
         conn.connect()  # uses connect_timeout
         conn.sock.settimeout(read_timeout)  # switch to full timeout for generation
+        # Register conn so the stuck-request watchdog can forcibly close it
+        if backend_key:
+            with _in_flight_lock:
+                _active_conns.setdefault(backend_key, []).append(conn)
         conn.request(
             "POST",
             parsed.path,
@@ -1344,10 +1416,17 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout):
             )
         return json.loads(resp.read())
     finally:
+        if backend_key:
+            with _in_flight_lock:
+                lst = _active_conns.get(backend_key, [])
+                try:
+                    lst.remove(conn)
+                except ValueError:
+                    pass
         conn.close()
 
 
-def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=None):
+def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=None, backend_key=None):
     url = base_url.rstrip("/") + "/api/chat"
     data = {
         "model": model,
@@ -1366,7 +1445,7 @@ def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=No
         data["think"] = params["think"]
 
     ct = connect_timeout or timeout
-    result = _http_post(url, json.dumps(data).encode(), ct, timeout)
+    result = _http_post(url, json.dumps(data).encode(), ct, timeout, backend_key=backend_key)
 
     content, tool_calls = _extract_content(result)
     # Ollama returns eval_count/prompt_eval_count, convert to OpenAI usage format
@@ -1379,7 +1458,7 @@ def _proxy_ollama(base_url, model, messages, params, timeout, connect_timeout=No
     return _wrap_openai_response(model, content, tool_calls, usage=usage)
 
 
-def _proxy_openai(base_url, model, messages, params, timeout, connect_timeout=None):
+def _proxy_openai(base_url, model, messages, params, timeout, connect_timeout=None, backend_key=None):
     url = base_url.rstrip("/") + "/v1/chat/completions"
     data = {
         "model": model,
@@ -1402,7 +1481,7 @@ def _proxy_openai(base_url, model, messages, params, timeout, connect_timeout=No
             data[key] = params[key]
 
     ct = connect_timeout or timeout
-    result = _http_post(url, json.dumps(data).encode(), ct, timeout)
+    result = _http_post(url, json.dumps(data).encode(), ct, timeout, backend_key=backend_key)
 
     content, tool_calls = _extract_content(result)
     usage = result.get("usage", {})
@@ -1437,6 +1516,7 @@ def _wrap_openai_response(model, content, tool_calls=None, usage=None):
 
 
 def proxy_to_backend(backend, messages, params, timeout, connect_timeout=None):
+    bkey = _backend_key(backend["host"], backend["name"])
     if backend["api"] == "ollama":
         return _proxy_ollama(
             backend["base_url"],
@@ -1445,6 +1525,7 @@ def proxy_to_backend(backend, messages, params, timeout, connect_timeout=None):
             params,
             timeout,
             connect_timeout=connect_timeout,
+            backend_key=bkey,
         )
     else:
         return _proxy_openai(
@@ -1454,6 +1535,7 @@ def proxy_to_backend(backend, messages, params, timeout, connect_timeout=None):
             params,
             timeout,
             connect_timeout=connect_timeout,
+            backend_key=bkey,
         )
 
 
@@ -1784,12 +1866,14 @@ function renderHeatmap() {
   const hostBuckets = {};
   let totalReqs = 0;
   for (const r of historyData) {
-    if (r.ts < tMin) continue;
+    const rts = r.start_ts !== undefined ? r.start_ts : r.ts;
+    if (rts < tMin) continue;
     totalReqs++;
     const host = r.host;
     if (!hostBuckets[host]) hostBuckets[host] = new Array(numCols).fill(0);
-    const bi = Math.min(numCols - 1, Math.floor((r.ts - tMin) / bucketSec));
-    hostBuckets[host][bi]++;
+    const biStart = Math.max(0, Math.floor((rts - tMin) / bucketSec));
+    const biEnd = Math.min(numCols - 1, Math.floor(((r.ts !== undefined ? r.ts : rts) - tMin) / bucketSec));
+    for (let bi = biStart; bi <= biEnd; bi++) hostBuckets[host][bi]++;
   }
 
   const hosts = Object.keys(hostBuckets).sort();
@@ -1912,7 +1996,7 @@ async function fetchHistory() {
     const chartMin = parseInt(document.getElementById('chart-window').value);
     const heatMin = parseInt(document.getElementById('heatmap-window').value);
     const windowMin = Math.max(chartMin, heatMin);
-    const since = Date.now()/1000 - windowMin * 60;
+    const since = Date.now()/1000 - windowMin * 60 - 3600;  // extra buffer for long-running requests
     const resp = await fetch('/history?since=' + since);
     const data = await resp.json();
     historyData = data.history || [];
@@ -2318,9 +2402,13 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
             state = dict(_backend_state)
         with _in_flight_lock:
             in_flight = dict(_in_flight)
+            in_flight_since = {k: list(v) for k, v in _in_flight_since.items()}
 
+        now = time.time()
         result = {}
         for key, s in sorted(state.items()):
+            ts_list = in_flight_since.get(key, [])
+            oldest_age = round(now - ts_list[0], 1) if ts_list else None
             result[key] = {
                 "status": s.get("status", "unknown"),
                 "score": round(backend_score(key)),
@@ -2328,6 +2416,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                 "latency_ms": round(s.get("latency_ms", 0)),
                 "failures": s.get("failures", 0),
                 "in_flight": in_flight.get(key, s.get("in_flight", 0)),
+                "oldest_in_flight_s": oldest_age,
                 "last_success": s.get("last_success", 0),
                 "last_probe": s.get("last_probe", 0),
             }
@@ -2604,8 +2693,25 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                     )
                     print(f"[caproute] slots full, deferring: {_busy_names}")
                 if not _slot_available:
-                    # All slots busy — don't queue, escalate or retry next round.
-                    break
+                    # All slots busy. Escalate immediately if a fallback exists,
+                    # so we don't spin-wait for 210s on a fully-loaded tier.
+                    cfg2 = load_config()
+                    fbs = _get_fallbacks(cfg2)
+                    if (
+                        actual_cap in fbs
+                        and fbs[actual_cap][0] not in visited_caps_this_round
+                    ):
+                        next_cap, hop_ov = fbs[actual_cap]
+                        if hop_ov:
+                            accumulated_overrides = {**accumulated_overrides, **hop_ov}
+                        visited_caps_this_round.add(actual_cap)
+                        current_cap = next_cap
+                        print(
+                            f"[caproute] slots full for {actual_cap}, "
+                            f"escalating -> {current_cap}"
+                        )
+                        continue  # inner while — try next capability immediately
+                    break  # no fallback available, break to outer retry loop
 
                 for backend in _slot_available:
                     if time.time() >= _total_deadline:
@@ -2638,6 +2744,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             actual_cap,
                             latency_ms,
                             True,
+                            start_ts=t0,
                         )
                         _record_session_usage(session_id, key)
                         _usage = result.get("usage", {})
@@ -2676,6 +2783,7 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                             actual_cap,
                             latency_ms,
                             False,
+                            start_ts=t0,
                         )
                         # Categorize error to decide retry strategy:
                         # 400 = bad request (context too large) → never retry this request
@@ -2799,6 +2907,57 @@ def main():
     p = threading.Thread(target=_probe_loop, daemon=True)
     p.start()
     print(f"[caproute] Probe interval: {PROBE_INTERVAL}s, timeout: {PROBE_TIMEOUT}s")
+
+    # Internal stuck-request watchdog — no network traffic, pure in-process state
+    def _stuck_watchdog_loop():
+        """Restart caproute if any backend request has been in-flight for >STUCK_THRESHOLD seconds.
+
+        This catches cases where a backend connection hangs beyond its timeout
+        (e.g. TCP socket not timing out as expected, or a thread pool exhaustion).
+        No inference requests are made — uses only internal _in_flight_since state.
+        """
+        STUCK_THRESHOLD = int(os.environ.get("CAPROUTE_STUCK_THRESHOLD", "300"))
+        CHECK_INTERVAL = 30
+        while True:
+            time.sleep(CHECK_INTERVAL)
+            try:
+                now = time.time()
+                with _in_flight_lock:
+                    snapshot = {k: list(v) for k, v in _in_flight_since.items() if v}
+                stuck = {
+                    k: round(now - ts_list[0], 0)
+                    for k, ts_list in snapshot.items()
+                    if (now - ts_list[0]) > STUCK_THRESHOLD
+                }
+                if stuck:
+                    details = ", ".join(f"{k}={int(age)}s" for k, age in stuck.items())
+                    print(
+                        f"[caproute] STUCK requests detected ({details}), "
+                        f"threshold={STUCK_THRESHOLD}s — force-closing backend connections"
+                    )
+                    # Close the stuck socket(s) for each affected backend.
+                    # This unblocks the waiting thread (raises socket.error),
+                    # which causes CapRoute to mark that backend as failed and
+                    # retry the request on the next available backend automatically.
+                    with _in_flight_lock:
+                        conns_to_close = {
+                            k: list(v) for k, v in _active_conns.items() if k in stuck
+                        }
+                    for bkey, conns in conns_to_close.items():
+                        for conn in conns:
+                            try:
+                                if conn.sock:
+                                    conn.sock.close()
+                                    print(f"[caproute] force-closed socket for {bkey}")
+                            except Exception as ce:
+                                print(f"[caproute] close error for {bkey}: {ce}")
+            except Exception as e:
+                print(f"[caproute] stuck-watchdog error: {e}")
+
+    w = threading.Thread(target=_stuck_watchdog_loop, daemon=True)
+    w.start()
+    stuck_threshold = int(os.environ.get("CAPROUTE_STUCK_THRESHOLD", "300"))
+    print(f"[caproute] Stuck-request watchdog: threshold={stuck_threshold}s, check every 30s")
 
     # Background config sync thread
     sync_peers = cfg.get("sync_peers", [])
