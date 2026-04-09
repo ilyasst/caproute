@@ -712,6 +712,17 @@ def _get_oldest_in_flight_age(key):
         return time.time() - ts_list[0]
 
 
+def _host_in_flight(host):
+    """Total in-flight requests across ALL models on a host."""
+    with _in_flight_lock:
+        total = 0
+        prefix = host + ":"
+        for k, v in _in_flight.items():
+            if k.startswith(prefix):
+                total += v
+        return total
+
+
 # Per-capability in-flight penalty (ms per in-flight request).
 # Loaded from llm.json inflight_penalties at call time so changes
 # take effect without a restart (config is hot-reloaded).
@@ -780,6 +791,18 @@ def backend_score(key, session_id=None, capability=None):
         score += in_flight * max(_base_penalty, 8000)
     else:
         score += in_flight * _base_penalty
+    # Host-level GPU contention penalty: if other models on this host have
+    # in-flight requests, penalise heavily to prefer idle machines.
+    # This prevents two models sharing a GPU from both crawling.
+    _host = key.split(":", 1)[0]
+    _host_total = _host_in_flight(_host)
+    _other_in_flight = _host_total - in_flight  # requests on OTHER models
+    if _other_in_flight > 0:
+        # Heavy penalty — prefer a different host entirely.
+        # 50000ms base = even a single other request makes this host
+        # less attractive than most alternatives.
+        _HOST_CONTENTION_PENALTY = 50_000
+        score += _other_in_flight * _HOST_CONTENTION_PENALTY
     # Penalty for idle (available but not loaded — will need cold-start)
     if status == "idle":
         score += 10000
