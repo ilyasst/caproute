@@ -529,7 +529,7 @@ def _db_query_since(since):
     try:
         with _db_lock:
             cur = _db_conn.execute(
-                "SELECT ts,start_ts,model,host,capability,latency_ms,ok FROM requests WHERE ts > ? ORDER BY ts",
+                "SELECT ts,start_ts,model,host,capability,latency_ms,ok,client FROM requests WHERE ts > ? ORDER BY ts",
                 (since,),
             )
             rows = cur.fetchall()
@@ -542,6 +542,7 @@ def _db_query_since(since):
                 "capability": r[4],
                 "latency_ms": r[5],
                 "ok": bool(r[6]),
+                "client": r[7] if len(r) > 7 else "",
             }
             for r in rows
         ]
@@ -2061,6 +2062,7 @@ async function fetchHistory() {
     historyData = data.history || [];
     renderChart();
     renderHeatmap();
+    renderRecentRequests();
   } catch(e) { console.error('fetchHistory error:', e); }
 }
 
@@ -2200,11 +2202,53 @@ function renderChart() {
 
 document.getElementById('chart-window').addEventListener('change', fetchHistory);
 
+
+function renderRecentRequests() {
+  const tbody = document.getElementById('recent-tbody');
+  if (!tbody) return;
+  const sorted = [...historyData].sort((a,b) => b.ts - a.ts).slice(0, 50);
+  let html = '';
+  for (const r of sorted) {
+    const t = new Date(r.ts * 1000);
+    const time = t.getHours().toString().padStart(2,'0') + ':' + t.getMinutes().toString().padStart(2,'0') + ':' + t.getSeconds().toString().padStart(2,'0');
+    const lat = r.latency_ms >= 1000 ? (r.latency_ms/1000).toFixed(1) + 's' : r.latency_ms + 'ms';
+    const ok = r.ok !== false;
+    const status = ok ? '<span style="color:var(--ok);">ok</span>' : '<span style="color:var(--down);">fail</span>';
+    const client = r.client || '-';
+    html += '<tr style="border-bottom:1px solid var(--border);">' +
+      '<td style="padding:3px 8px;color:var(--dim);">' + time + '</td>' +
+      '<td style="padding:3px 8px;">' + client + '</td>' +
+      '<td style="padding:3px 8px;">' + (r.capability || '-') + '</td>' +
+      '<td style="padding:3px 8px;">' + (r.model || '-') + '</td>' +
+      '<td style="padding:3px 8px;">' + (r.host || '-') + '</td>' +
+      '<td style="padding:3px 8px;font-variant-numeric:tabular-nums;">' + lat + '</td>' +
+      '<td style="padding:3px 8px;">' + status + '</td></tr>';
+  }
+  tbody.innerHTML = html || '<tr><td colspan="7" style="padding:8px;color:var(--dim);">No recent requests</td></tr>';
+}
+
 fetchAll();
 fetchHistory();
 setInterval(fetchAll, POLL_MS);
 setInterval(fetchHistory, POLL_MS);
 </script>
+
+
+<div class="section-title" style="margin-top:24px;">Recent Requests</div>
+<div style="overflow-x:auto;">
+<table id="recent-requests" style="width:100%; font-size:12px; border-collapse:collapse;">
+  <thead><tr style="border-bottom:1px solid var(--border); text-align:left;">
+    <th style="padding:4px 8px;">Time</th>
+    <th style="padding:4px 8px;">From</th>
+    <th style="padding:4px 8px;">Capability</th>
+    <th style="padding:4px 8px;">Model</th>
+    <th style="padding:4px 8px;">Host</th>
+    <th style="padding:4px 8px;">Latency</th>
+    <th style="padding:4px 8px;">Status</th>
+  </tr></thead>
+  <tbody id="recent-tbody"></tbody>
+</table>
+</div>
 
 <div style="margin-top:32px; border-top:1px solid var(--border); padding-top:16px; color:var(--dim); font-size:11px; line-height:1.7;">
   <div class="section-title" style="margin-top:0;">Glossary</div>
