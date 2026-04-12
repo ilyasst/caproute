@@ -1485,6 +1485,7 @@ def _http_post(url, body_bytes, connect_timeout, read_timeout, backend_key=None)
             body=body_bytes,
             headers={
                 "Content-Type": "application/json",
+                "X-No-Queue": "1",
             },
         )
         resp = conn.getresponse()
@@ -2952,7 +2953,12 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         return
                     except Exception as e:
                         latency_ms = (time.time() - t0) * 1000
-                        _record_failure(key)
+                        err_str = str(e)
+                        # 503 with "no-queue" = slot busy, not a health failure.
+                        # Soft-skip for this round but don't penalize the backend.
+                        is_slot_busy = "503" in err_str and latency_ms < 5000
+                        if not is_slot_busy:
+                            _record_failure(key)
                         _record_request(
                             backend["name"],
                             backend["host"],
@@ -2965,15 +2971,18 @@ class CaprouteHandler(http.server.BaseHTTPRequestHandler):
                         # Categorize error to decide retry strategy:
                         # 400 = bad request (context too large) → never retry this request
                         # 500 = server error → skip this round, retry next round
+                        # 503 fast (<5s) = slot busy (X-No-Queue) → skip this round
                         # timeout = backend was working but slow → don't skip
-                        err_str = str(e)
                         if "400" in err_str:
                             _hard_failed_keys.add(key)
+                        elif is_slot_busy:
+                            _soft_failed_keys.add(key)
                         elif "500" in err_str or "502" in err_str or "503" in err_str:
                             _soft_failed_keys.add(key)
                         # Timeouts and connection errors: don't add to failed sets
                         # (backend may recover, or other slot may be free)
-                        err = f"{backend['name']}@{backend['host']}: {e}"
+                        tag = " (slot busy)" if is_slot_busy else ""
+                        err = f"{backend['name']}@{backend['host']}: {e}{tag}"
                         print(f"[caproute] FAIL {err}")
                         errors.append(err)
                     finally:

@@ -208,6 +208,15 @@ curl http://localhost:8800/stats
 curl http://localhost:8800/stats/routing
 ```
 
+### Centralized queuing via X-No-Queue
+
+caproute sends the `X-No-Queue: 1` header on all proxied requests. When a backend runs llama-proxy, this tells it to return 503 immediately if the slot is busy instead of queuing locally. This is critical for correct routing:
+
+- **Without X-No-Queue:** llama-proxy accepts the TCP connection and queues silently. The request is stuck on that machine even if another backend frees up seconds later. caproute's 2s connect timeout never fires because TCP connect succeeds instantly — the delay is hidden inside the local queue. This caused 200+ second queue waits on peacefeeder while peacewalker had idle slots.
+- **With X-No-Queue:** llama-proxy rejects instantly (503) → caproute tries the next backend → if all busy, sleeps 2s and retries. The request lands on whichever slot frees up first, anywhere in the fleet.
+
+503s from slot-busy backends are **not counted as health failures** — the backend is healthy, just occupied. They're soft-skipped for the current round and retried next round.
+
 ### Default max_tokens
 
 When clients don't specify `max_tokens`, caproute injects a default of **8192** tokens. This prevents llama-server's OpenAI-compat default of 4096, which truncates thinking models (reasoning can consume 4K+ tokens alone, leaving nothing for the actual answer).
